@@ -45,3 +45,5 @@ Name_v3.[file]
 AI decides if user did not create yet
 When multiple files are being edited and it's better to have a version2 folder than file1_v2, file2_v2 etc... for files:
 Create subfolder: folder_name[x+1]
+In VSCode, the folders are ordered alphabetically, as the number of file grows, it takes time to scroll down to see files
+Therefore, the AI or user should organize folder names with this rule: 1_Most_frequent_folder ... 3_less_frequent ... 5_infrequent(like general info and stuff)
