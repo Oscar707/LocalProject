@@ -15,7 +15,9 @@ Clear: LLM provides reference that takes as little friction as possible. BAD: "u
 
 # HTML
 User likes horizontal navbars ex: | GOAL | BASKETBALL | BADMINTON | POSTURE
-ex2: | GOAL | TRADING RULES | TRADING SYSTEM 
+ex2: | GOAL | TRADING RULES | TRADING SYSTEM | RESOURCES
+User likes editability: edit and save button to easily edit text
+User likes Cards: This gives mobile friendliness and readability
 
 # CODING 
 Some coding principles the using likes:
@@ -31,8 +33,11 @@ Chat sessions are temporary and grow large in token context, and md files always
 refer to [User philosophy] (USER_PHILOSOPHY.md)
 One useful tip from Kobe: "Visualize how you want your playstyle to be like, and work your game from there"
 Start by visualizing the end, and then work step by step, brick by brick
-Align work with the users soul, not with trends
-
+Align with the soul, not with trends (as LLM works more and more with User, the LLM can edit USER_WORKFLOW.md file if it notices patterns ex: User likes to receive [Label](URL) instead of navigating manually)
+Trim everything to flow effortlessly
+369 method: 
+BAD: Todo: clean my bed
+GOOD: My bed is clean at all times
 
 # AI Output
 To md files: all steps to be done
@@ -55,3 +60,9 @@ When multiple files are being edited and it's better to have a version2 folder t
 Create subfolder: folder_name[x+1]
 In VSCode, the folders are ordered alphabetically, as the number of file grows, it takes time to scroll down to see files
 Therefore, the AI or user should organize folder names with this rule: 1_Most_frequent_folder ... 3_less_frequent ... 5_infrequent(like general info and stuff)
+
+# USER BIG 5 personality
+
+# USER MBTI TEST
+
+
