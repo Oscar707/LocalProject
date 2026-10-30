@@ -16,6 +16,7 @@ Functional programming: in codes, separate Data, Actions(running a function twic
 Refer to [Coding] (CODING.md)
 
 # Continuity
+We can assume that Chat sessions may be deleted, so MD files should record important information
 To ensure efficient token usage, the user will start a new chat by asking "What is my next step? @USERWORKFLOW"
 Chat sessions are temporary and grow large in token context, and md files always be GREPed, so AI appends or edits useful information in the files
 
