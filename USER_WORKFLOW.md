@@ -3,7 +3,7 @@ This md file describes how the user likes to work with AI
 
 # User workflow
 User has a project, a task
-User will refer to this file in a LLM chat: "Lets continue to work on @PROJECT.md @USERWORLKFLOW.md"
+User will refer to this file in a LLM chat: "I want to do XYZ, create file(s) and populate as per @USERWORLKFLOW.md"
 
 # AI Judgement
 AI can use sound judgement to skip or ignore impossible steps, work efficiently, not just blindly follow rules
