@@ -29,9 +29,6 @@ To LLM chat: A short summary of what is going on, and the MOST IMPORTANT NEXT ST
 BAD: "Do x,y,z, then a,b,c, then 1,2,3"
 Good: "So ..., next step: x,y,z"
 
-# AI Permissions
-AI can delete lines once it consider them of no use. AI can ask the user clarifying questions (max 3), does not have to infer all the time
-
 # File naming
 The project will grow as time goes on, so naming files and folders should be done mindfully
 When time matters (like a LOG file):
