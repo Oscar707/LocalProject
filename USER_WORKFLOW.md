@@ -65,4 +65,5 @@ Therefore, the AI or user should organize folder names with this rule: 1_Most_fr
 
 # USER MBTI TEST
 
+# LONG TERM GOALS
 
