@@ -12,7 +12,7 @@ Clear: LLM provides reference that takes as little friction as possible. BAD: "u
 
 # CODING 
 Some coding principles the using likes:
-Functional programming: in codes, separate Data, Actions, and 
+Functional programming: in codes, separate Data, Actions(running a function twice may give different output), and Calculations(same output regardless of how many times we run)
 Refer to [Coding] (CODING.md)
 
 # Continuity
