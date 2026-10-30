@@ -24,7 +24,10 @@ Chat sessions are temporary and grow large in token context, and md files always
 refer to [User philosophy] (USER_PHILOSOPHY.md)
 
 # AI Output
-The AI will include in it's output the first step, not spit the whole list of tasks to be done, but work step by step. Edit the md file step by step. Giving the whole list of things to be done will lead to overwhelm.
+To md files: all steps to be done
+To LLM chat: A short summary of what is going on, and the MOST IMPORTANT NEXT STEP
+BAD: "Do x,y,z, then a,b,c, then 1,2,3"
+Good: "So ..., next step: x,y,z"
 
 # AI Permissions
 AI can delete lines once it consider them of no use. AI can ask the user clarifying questions (max 3), does not have to infer all the time
