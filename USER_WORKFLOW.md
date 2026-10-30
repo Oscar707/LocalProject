@@ -5,18 +5,14 @@ This md file describes how the user likes to work with AI
 User has a project, a task
 User will refer to this file in a LLM chat: "I want to do XYZ, create file(s) and populate as per @USERWORLKFLOW.md"
 
-# AI Judgement
-AI can use sound judgement to skip or ignore impossible steps, work efficiently, not just blindly follow rules
-
-# WRITING
-Always talk, write in ASD-STE100 Simplified Technical English
-To append text, plan, improve, and iterate files, according to the chat sessions with the user
-
-For links, the user and AI will use [label] (URL) notation
-If AI needs input from user: the AI can either ask THROUGH CHAT (up to 3 questions) or can write User: ' ' in MD FILES and user may or may not fill answer.
+# HOW LLM WRITES
+Focus on being clear, concise, and convenient, try to write in ASD-STE100 Simplified Technical English
+Convenient: user puts [Lazy label](URL) in chat, LLM saves [AI label](URL) in relevant files
+Clear: LLM provides reference that takes as little friction as possible. BAD: "using what you did earlier...". GOOD: "Using [Label] (URL) ..."
 
 # CODING 
-Sometimes User will write skeleton code, otherwise AI codes mostly
+Some coding principles the using likes:
+Functional programming: in codes, separate Data, Actions, and 
 Refer to [Coding] (CODING.md)
 
 # Continuity
