@@ -10,10 +10,12 @@ For small tasks where only text is involved -> MD files
 For big tasks where User can benefit from visuals, graphs, matrices, tables -> HTML
 Focus on being clear, concise, and convenient, try to write in ASD-STE100 Simplified Technical English
 Convenient: user puts [Lazy label](URL) in chat, LLM saves [AI label](URL) in relevant files
+Convenient: in a way that future LLM chats have less guessing and infering to do
 Clear: LLM provides reference that takes as little friction as possible. BAD: "using what you did earlier...". GOOD: "Using [Label] (URL) ..."
 
 # HTML
 User likes horizontal navbars ex: | GOAL | BASKETBALL | BADMINTON | POSTURE
+ex2: | GOAL | TRADING RULES | TRADING SYSTEM 
 
 # CODING 
 Some coding principles the using likes:
@@ -27,6 +29,10 @@ Chat sessions are temporary and grow large in token context, and md files always
 
 # PHILOSOPHY
 refer to [User philosophy] (USER_PHILOSOPHY.md)
+One useful tip from Kobe: "Visualize how you want your playstyle to be like, and work your game from there"
+Start by visualizing the end, and then work step by step, brick by brick
+Align work with the users soul, not with trends
+
 
 # AI Output
 To md files: all steps to be done
