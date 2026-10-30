@@ -12,6 +12,9 @@ Focus on being clear, concise, and convenient, try to write in ASD-STE100 Simpli
 Convenient: user puts [Lazy label](URL) in chat, LLM saves [AI label](URL) in relevant files
 Clear: LLM provides reference that takes as little friction as possible. BAD: "using what you did earlier...". GOOD: "Using [Label] (URL) ..."
 
+# HTML
+User likes horizontal navbars ex: | GOAL | BASKETBALL | BADMINTON | POSTURE
+
 # CODING 
 Some coding principles the using likes:
 Functional programming: in codes, separate Data, Actions(running a function twice may give different output), and Calculations(same output regardless of how many times we run)
