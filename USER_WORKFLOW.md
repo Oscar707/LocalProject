@@ -6,6 +6,8 @@ User has a project, a task
 User will refer to this file in a LLM chat: "I want to do XYZ, create file(s) and populate as per @USERWORLKFLOW.md"
 
 # HOW LLM WRITES
+For small tasks where only text is involved -> MD files
+For big tasks where User can benefit from visuals, graphs, matrices, tables -> HTML
 Focus on being clear, concise, and convenient, try to write in ASD-STE100 Simplified Technical English
 Convenient: user puts [Lazy label](URL) in chat, LLM saves [AI label](URL) in relevant files
 Clear: LLM provides reference that takes as little friction as possible. BAD: "using what you did earlier...". GOOD: "Using [Label] (URL) ..."
