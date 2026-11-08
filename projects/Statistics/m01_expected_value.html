@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>M01 Expected Value</title>
+<style>
+  :root {
+    --bg: #0e1014; --surface: #161920; --surface-2: #1d212b; --border: #272c38;
+    --text: #e4e7ec; --muted: #98a1b2; --accent: #7aa2f7; --accent-2: #9ece6a;
+    --warn: #e0af68; --danger: #f7768e; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 110px; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-text-size-adjust: 100%; }
+  header { position: sticky; top: 0; z-index: 10; background: rgba(14,16,20,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+  .bar { max-width: 820px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 8px; }
+  .bar h1 { font-size: 18px; margin: 0; flex: 1; }
+  .bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+  button { font: inherit; font-size: 14px; font-weight: 600; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; cursor: pointer; min-height: 38px; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #0e1014; border-color: var(--accent); }
+  button.hidden { display: none; }
+  nav { max-width: 820px; margin: 0 auto; display: flex; gap: 6px; overflow-x: auto; padding: 0 16px 10px; scrollbar-width: none; }
+  nav::-webkit-scrollbar { display: none; }
+  nav a { flex: none; font-size: 13px; color: var(--muted); text-decoration: none; padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; }
+  nav a.done { border-color: var(--accent-2); color: var(--accent-2); }
+  main { max-width: 820px; margin: 0 auto; padding: 16px 16px 64px; }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 18px 14px; margin-bottom: 16px; }
+  h2 { margin: 0 0 10px; font-size: 19px; display: flex; align-items: baseline; gap: 8px; }
+  h2 .n { color: var(--accent); font-size: 14px; font-weight: 700; }
+  h3 { margin: 16px 0 6px; font-size: 15px; color: var(--accent-2); }
+  p { margin: 0 0 10px; }
+  ul { margin: 0 0 10px; padding-left: 22px; }
+  li::marker { color: var(--accent); }
+  .muted { color: var(--muted); }
+  code { font: 13.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--surface-2); border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; word-break: break-word; }
+  .forget { font-size: 14px; color: var(--warn); border-left: 3px solid var(--warn); padding: 4px 10px; margin-bottom: 12px; background: var(--surface-2); border-radius: 0 8px 8px 0; }
+  .task { margin-bottom: 10px; }
+  .inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .inputs label { display: block; font-size: 12.5px; color: var(--muted); }
+  input[type=number], textarea { width: 100%; font: inherit; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+  input[type=number]:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input:disabled { opacity: .7; }
+  textarea { min-height: 54px; font-size: 14.5px; resize: vertical; }
+  .guess { background: var(--surface-2); border: 1px dashed var(--accent); border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+  .guess .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .guess .row input { flex: 1 1 120px; max-width: 200px; }
+  .guess .unit { color: var(--muted); font-size: 14px; }
+  .guess textarea { margin-top: 8px; }
+  .reveal { display: none; }
+  .revealed .reveal { display: block; }
+  .result { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin: 10px 0; }
+  .stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .stat b { display: block; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+  .stat span { font-size: 24px; font-weight: 700; }
+  .stat.main span { color: var(--accent-2); }
+  .stat.err span { color: var(--warn); }
+  .formula { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin-bottom: 10px; }
+  .mistake { border-left: 3px solid var(--danger); padding: 6px 10px; background: var(--surface-2); border-radius: 0 8px 8px 0; margin-bottom: 10px; font-size: 14.5px; }
+  .theory { border-left: 3px solid var(--accent); padding: 6px 10px; background: var(--surface-2); border-radius: 0 8px 8px 0; margin-bottom: 10px; font-size: 14.5px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .user { border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; min-height: 34px; color: var(--muted); }
+  body.editing .user, body.editing [data-ed] { border-color: var(--accent); color: var(--text); background: rgba(122,162,247,.06); }
+  .banner { display: none; max-width: 820px; margin: 0 auto; padding: 0 16px 10px; font-size: 13px; color: var(--warn); }
+  body.editing .banner { display: block; }
+  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(80px); background: var(--surface-2);
+    border: 1px solid var(--accent); color: var(--text); padding: 10px 16px; border-radius: 10px; font-size: 14px;
+    transition: transform .25s ease; z-index: 20; max-width: calc(100% - 32px); }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  @media (max-width: 480px) {
+    body { font-size: 15.5px; }
+    section { padding: 14px 14px 10px; }
+    .bar h1 { font-size: 16px; }
+    button { padding: 7px 10px; font-size: 13px; }
+    .stat span { font-size: 21px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a href="statistics.html">← Hub</a>
+    <h1>M01 Expected Value</h1>
+    <button id="editBtn" class="primary">Edit</button>
+    <button id="cancelBtn" class="hidden">Cancel</button>
+    <button id="downloadBtn">Download</button>
+  </div>
+  <div class="banner">Edit mode: tap a dashed box to write. Tap Save when done.</div>
+  <nav id="nav"></nav>
+</header>
+
+<main id="content">
+  <section id="c00">
+    <h2><span class="n">00</span> Goal</h2>
+    <p><b>End of this module:</b> you can calculate the expected value (EV) of any decision with 2 or more outcomes, in League and in trading. You know why a high win rate alone does not give an edge.</p>
+    <h3>How each card works</h3>
+    <ul>
+      <li><b>Forget:</b> read the yellow line. Drop the old idea.</li>
+      <li><b>Act:</b> type your guess. Calculate on paper or use gut feeling. No calculator. The Reveal button stays locked until you type a number.</li>
+      <li><b>Review:</b> Reveal shows the answer, your error and the common mistake. Then the theory.</li>
+      <li><b>Teach:</b> write the idea in 1 sentence for a teammate.</li>
+      <li><b>New numbers:</b> after a reveal, try the same card again with random numbers. Repetition with variation builds intuition.</li>
+    </ul>
+    <h3>State check</h3>
+    <p class="muted">Energy now (1–10)? Why does this matter to you today?</p>
+    <div class="user" data-ed id="state">User: ' '</div>
+  </section>
+  <!-- Challenge cards are built from DATA by the script -->
+  <div id="cards"></div>
+
+  <section id="summary">
+    <h2><span class="n">07</span> Module summary</h2>
+    <div id="scoreTable"></div>
+    <h3>Key formulas</h3>
+    <div class="formula">EV = p₁·x₁ + p₂·x₂ + … (all p add up to 1)
+2 outcomes: EV = p·W − (1−p)·L
+Break-even win rate = L / (W + L) = 1 / (1 + R)   (R = W / L)
+Total expectancy = EV per trade × number of trades</div>
+    <h3>Short reading (after the cards, not before)</h3>
+    <ul>
+      <li>Annie Duke, <i>Thinking in Bets</i>, chapter 1 (~20 min): good decisions vs good results.</li>
+      <li>Van K. Tharp, "expectancy" and "R-multiples" (search the 2 terms, read 1 short article): how traders measure EV per trade.</li>
+      <li>[Expected value, intro only](https://en.wikipedia.org/wiki/Expected_value) (~5 min).</li>
+    </ul>
+    <h3>Teach the whole module in 3 sentences</h3>
+    <div class="user" data-ed id="teachAll">User: ' '</div>
+    <p class="muted" style="margin-top:10px">Next: M02 Variance &amp; sample size. Your EV is the average. Variance is why you can lose 5 games in a row with a +EV strategy.</p>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ========== DATA ========== */
+var MODULE = 'm01';
+var STORE_KEY = 'stats_' + MODULE;          // guesses and scores (read by the hub)
+var EDIT_KEY = 'stats_' + MODULE + '_notes'; // text the user wrote in Edit mode
+
+// Each card: inputs (editable), a guess, and a pure calculation.
+// rand() gives "new numbers" for a re-try.
+var CARDS = [
+  {
+    id: 'c01', title: 'EV of one trade',
+    forget: 'Forget "I win only 40% of my trades, so my system is bad".',
+    task: 'Your setup wins <b>p</b> of the time. A win pays <b>W</b> R (R = the money you risk). A loss costs <b>L</b> R. What do you win or lose <b>per trade</b>, on average?',
+    inputs: [
+      { k: 'p', label: 'Win rate p (%)', v: 40 },
+      { k: 'W', label: 'Win W (R)', v: 3 },
+      { k: 'L', label: 'Loss L (R)', v: 1 }
+    ],
+    unit: 'R per trade',
+    rand: function () { return { p: pick([30, 35, 40, 45, 50, 55, 60]), W: pick([1, 1.5, 2, 2.5, 3]), L: 1 }; }
+  },
+  {
+    id: 'c02', title: 'Break-even win rate',
+    forget: 'Forget "50% win rate is break-even".',
+    task: 'A win pays <b>W</b> R, a loss costs <b>L</b> R. What is the <b>lowest win rate</b> where you do not lose money (EV = 0)?',
+    inputs: [
+      { k: 'W', label: 'Win W (R)', v: 3 },
+      { k: 'L', label: 'Loss L (R)', v: 1 }
+    ],
+    unit: '% win rate',
+    rand: function () { return { W: pick([0.5, 1, 1.5, 2, 4]), L: 1 }; }
+  },
+  {
+    id: 'c03', title: 'Dragon contest: compare the options',
+    forget: 'Forget "a −EV play is always bad". Compare it with the other option, not with zero.',
+    task: 'Enemy starts dragon. <b>Option A, contest:</b> you win the fight <b>p</b> of the time (you get the dragon + 2 kills). If you lose, they get the dragon + 2 kills. <b>Option B, give it:</b> they get the dragon for free. Value in gold: dragon = <b>D</b>, 1 kill = <b>K</b>. What is the <b>EV of contesting</b>, in gold, for your team?',
+    inputs: [
+      { k: 'p', label: 'Win fight p (%)', v: 45 },
+      { k: 'D', label: 'Dragon value D (gold)', v: 1000 },
+      { k: 'K', label: 'Kill value K (gold)', v: 300 }
+    ],
+    unit: 'gold',
+    rand: function () { return { p: pick([30, 35, 40, 45, 50]), D: pick([800, 1000, 1500, 2000]), K: 300 }; }
+  },
+  {
+    id: 'c04', title: 'More than 2 outcomes',
+    forget: 'Forget "a trade is only a win or a loss".',
+    task: 'You take partial profits. <b>a%</b> of trades hit the full target (+3R). <b>b%</b> stop out at the partial (+0.5R). The rest lose −1R. EV per trade?',
+    inputs: [
+      { k: 'a', label: 'Full target a (%)', v: 30 },
+      { k: 'b', label: 'Partial b (%)', v: 20 }
+    ],
+    unit: 'R per trade',
+    rand: function () { return { a: pick([15, 20, 25, 30]), b: pick([10, 20, 30]) }; }
+  },
+  {
+    id: 'c05', title: 'The win rate trap',
+    forget: 'Forget "high win rate = good system".',
+    task: 'System A wins <b>p</b> of the time. Wins are small (<b>W</b> R) and losses are big (<b>L</b> R), because you "let losers run". EV per trade of system A?',
+    inputs: [
+      { k: 'p', label: 'Win rate p (%)', v: 70 },
+      { k: 'W', label: 'Win W (R)', v: 0.5 },
+      { k: 'L', label: 'Loss L (R)', v: 1.5 }
+    ],
+    unit: 'R per trade',
+    rand: function () { return { p: pick([65, 70, 75, 80]), W: pick([0.3, 0.5]), L: pick([1.5, 2, 2.5]) }; }
+  },
+  {
+    id: 'c06', title: 'Your EV over many reps',
+    forget: 'Forget the one result. Think of the 100 next decisions.',
+    task: 'Your system: win rate <b>p</b>, avg win <b>W</b> R, avg loss <b>L</b> R. You risk <b>$r</b> per trade and take <b>n</b> trades per month. Expected profit per month in $?',
+    inputs: [
+      { k: 'p', label: 'Win rate p (%)', v: 45 },
+      { k: 'W', label: 'Avg win W (R)', v: 2 },
+      { k: 'L', label: 'Avg loss L (R)', v: 1 },
+      { k: 'r', label: 'Risk per trade $r', v: 50 },
+      { k: 'n', label: 'Trades per month n', v: 20 }
+    ],
+    unit: '$ per month',
+    rand: function () { return { p: pick([35, 40, 45, 50]), W: pick([1.5, 2, 2.5]), L: 1, r: pick([20, 50, 100]), n: pick([10, 20, 40]) }; }
+  }
+];
+
+/* ========== CALCULATIONS (pure) ========== */
+function round(x, d) { var f = Math.pow(10, d); return Math.round(x * f) / f; }
+
+function evTwo(p, W, L) { return p * W - (1 - p) * L; }
+
+function solve(id, v) {
+  var p = v.p / 100;
+  switch (id) {
+    case 'c01': {
+      var ev = evTwo(p, v.W, v.L);
+      return {
+        answer: round(ev, 3),
+        stats: [['EV per trade', fmt(ev, 2) + ' R'], ['After 100 trades', fmt(ev * 100, 0) + ' R']],
+        formula: 'EV = p·W − (1−p)·L\n   = ' + v.p / 100 + '·' + v.W + ' − ' + round(1 - p, 2) + '·' + v.L + '\n   = ' + round(p * v.W, 3) + ' − ' + round((1 - p) * v.L, 3) + ' = ' + fmt(ev, 3) + ' R',
+        mistake: 'Common error: looking only at the win rate. ' + v.p + '% wins sounds weak, but each win is ' + round(v.W / v.L, 2) + '× bigger than a loss. EV combines both numbers.',
+        theory: 'Expected value = the average result per decision if you repeat it many times. Multiply each outcome by its probability, then add. One trade can lose. The average over many trades goes to the EV.'
+      };
+    }
+    case 'c02': {
+      var be = v.L / (v.W + v.L);
+      return {
+        answer: round(be * 100, 2),
+        stats: [['Break-even', fmt(be * 100, 1) + ' %'], ['R = W/L', fmt(v.W / v.L, 2)]],
+        formula: 'Set EV = 0:  p·W = (1−p)·L\n p = L / (W + L) = ' + v.L + ' / (' + v.W + ' + ' + v.L + ') = ' + fmt(be * 100, 1) + ' %',
+        mistake: '50% is break-even only when wins and losses are the same size. Bigger wins → you can be wrong more often. Smaller wins → you must be right more often.',
+        theory: 'Break-even win rate = 1 / (1 + R), with R = W / L. R = 1 → 50%. R = 2 → 33%. R = 3 → 25%. Your edge = your real win rate − break-even win rate.'
+      };
+    }
+    case 'c03': {
+      var swing = v.D + 2 * v.K;
+      var evA = p * swing - (1 - p) * swing;
+      var evB = -v.D;
+      var better = evA > evB ? 'A (contest)' : 'B (give it)';
+      // Break-even fight win rate vs option B: p·S − (1−p)·S = −D → p = (S − D) / (2S)
+      var pBe = (swing - v.D) / (2 * swing);
+      return {
+        answer: round(evA, 1),
+        stats: [['EV contest (A)', fmt(evA, 0) + ' g'], ['EV give (B)', fmt(evB, 0) + ' g'], ['Better', better], ['Contest if p >', fmt(pBe * 100, 1) + ' %']],
+        formula: 'Swing S = D + 2K = ' + v.D + ' + 2·' + v.K + ' = ' + swing + ' g\nEV(A) = p·S − (1−p)·S = ' + p + '·' + swing + ' − ' + round(1 - p, 2) + '·' + swing + ' = ' + fmt(evA, 0) + ' g\nEV(B) = −D = ' + evB + ' g\nA is better when EV(A) > EV(B) → p > (S − D) / 2S = ' + fmt(pBe * 100, 1) + ' %',
+        mistake: 'Common error: "EV of contest is negative, so do not contest". The real choice is A vs B. B is not 0 gold, B is −' + v.D + ' gold for sure.',
+        theory: 'EV is a tool to compare options. Always ask: "compared with what?" A −EV play can be the best play if every other option is worse. (Simple model: it ignores deaths timers, waves and next objectives.)'
+      };
+    }
+    case 'c04': {
+      var a = v.a / 100, b = v.b / 100, c = 1 - a - b;
+      var ev4 = a * 3 + b * 0.5 - c * 1;
+      return {
+        answer: round(ev4, 3),
+        stats: [['EV per trade', fmt(ev4, 2) + ' R'], ['Loss rate', fmt(c * 100, 0) + ' %']],
+        formula: 'EV = a·3 + b·0.5 + (1−a−b)·(−1)\n   = ' + a + '·3 + ' + b + '·0.5 − ' + round(c, 2) + '·1\n   = ' + round(a * 3, 3) + ' + ' + round(b * 0.5, 3) + ' − ' + round(c, 3) + ' = ' + fmt(ev4, 3) + ' R',
+        mistake: 'Common error: forgetting the third group (the losers = 100% − a − b), or adding the probabilities to more than 100%.',
+        theory: 'EV works for any number of outcomes: EV = Σ pᵢ·xᵢ. The only rule: all probabilities add up to 1 (100%).'
+      };
+    }
+    case 'c05': {
+      var ev5 = evTwo(p, v.W, v.L);
+      var be5 = v.L / (v.W + v.L);
+      return {
+        answer: round(ev5, 3),
+        stats: [['EV per trade', fmt(ev5, 2) + ' R'], ['Break-even', fmt(be5 * 100, 1) + ' %']],
+        formula: 'EV = ' + p + '·' + v.W + ' − ' + round(1 - p, 2) + '·' + v.L + ' = ' + round(p * v.W, 3) + ' − ' + round((1 - p) * v.L, 3) + ' = ' + fmt(ev5, 3) + ' R\nBreak-even = L/(W+L) = ' + fmt(be5 * 100, 1) + ' %',
+        mistake: 'Common error: "' + v.p + '% wins must be profitable". With wins of ' + v.W + 'R and losses of ' + v.L + 'R you need more than ' + fmt(be5 * 100, 1) + '% wins. A high win rate feels good, but feeling good is not EV.',
+        theory: 'Win rate and payoff are 2 halves of 1 number. Many new traders cut winners early and hold losers: the win rate goes up and the EV goes down. In League: a champion with 53% win rate in 20 games tells you little alone (see M02).'
+      };
+    }
+    case 'c06': {
+      var ev6 = evTwo(p, v.W, v.L);
+      var month = ev6 * v.r * v.n;
+      return {
+        answer: round(month, 2),
+        stats: [['EV per trade', fmt(ev6, 2) + ' R'], ['EV per trade $', fmt(ev6 * v.r, 2)], ['Per month', '$' + fmt(month, 0)], ['Per year', '$' + fmt(month * 12, 0)]],
+        formula: 'EV per trade = ' + p + '·' + v.W + ' − ' + round(1 - p, 2) + '·' + v.L + ' = ' + fmt(ev6, 3) + ' R\nIn $ = EV·r = ' + fmt(ev6, 3) + '·' + v.r + ' = $' + fmt(ev6 * v.r, 2) + '\nPer month = ·n = ' + fmt(ev6 * v.r, 2) + '·' + v.n + ' = $' + fmt(month, 2),
+        mistake: 'Common error: multiplying in the wrong order, or forgetting to convert R to $. Step by step: EV in R → × risk in $ → × number of trades.',
+        theory: 'Total expectancy = EV per decision × number of decisions. A small edge with many reps beats a big edge with few reps. This is the same in League: +1% win chance per small decision × 50 decisions per game. But the real month will not be exactly this number. How far off it can be is M02 (variance).'
+      };
+    }
+  }
+}
+
+// Score 0–100: how close the guess is. Error is relative to the size of the answer.
+function calibration(guess, answer) {
+  var scale = Math.max(Math.abs(answer), 0.1);
+  return Math.max(0, Math.round(100 - 100 * Math.abs(guess - answer) / scale));
+}
+
+function fmt(x, d) { return round(x, d).toLocaleString('en-US', { maximumFractionDigits: d }); }
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+// Exposed for tests in Node
+if (typeof module !== 'undefined') module.exports = { solve: solve, calibration: calibration, evTwo: evTwo };
+
+/* ========== ACTIONS (UI) ========== */
+if (typeof document !== 'undefined') (function () {
+  var cardsEl = document.getElementById('cards');
+  var toast = document.getElementById('toast');
+  var nav = document.getElementById('nav');
+
+  function load(key) { try { return JSON.parse(localStorage.getItem(key)) || {}; } catch (e) { return {}; } }
+  function save(key, obj) { try { localStorage.setItem(key, JSON.stringify(obj)); } catch (e) {} }
+  var store = load(STORE_KEY); // { c01: { attempts: [ {guess, answer, score, inputs} ], teach } }
+
+  function showToast(msg) {
+    toast.textContent = msg; toast.classList.add('show');
+    clearTimeout(showToast.t); showToast.t = setTimeout(function () { toast.classList.remove('show'); }, 2200);
+  }
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  function buildCard(card, i) {
+    var s = document.createElement('section');
+    s.id = card.id;
+    var inputsHtml = card.inputs.map(function (inp) {
+      return '<div><label for="' + card.id + '_' + inp.k + '">' + inp.label + '</label>' +
+        '<input type="number" step="any" id="' + card.id + '_' + inp.k + '" data-k="' + inp.k + '" value="' + inp.v + '"></div>';
+    }).join('');
+    s.innerHTML =
+      '<h2><span class="n">' + pad(i + 1) + '</span> ' + card.title + '</h2>' +
+      '<div class="forget">Forget: ' + card.forget.replace(/^Forget /, '') + '</div>' +
+      '<p class="task">' + card.task + '</p>' +
+      '<div class="inputs">' + inputsHtml + '</div>' +
+      '<div class="guess"><div class="row"><input type="number" step="any" class="g" placeholder="Your guess"><span class="unit">' + card.unit + '</span>' +
+      '<button class="primary rv" disabled>Reveal</button></div>' +
+      '<textarea class="work" placeholder="Show your work (optional): how did you get it?"></textarea></div>' +
+      '<div class="reveal">' +
+        '<div class="result"></div>' +
+        '<div class="formula"></div>' +
+        '<div class="mistake"></div>' +
+        '<div class="theory"></div>' +
+        '<h3>Teach it (1 sentence, for a teammate)</h3>' +
+        '<textarea class="teach" placeholder="User: \' \'"></textarea>' +
+        '<div class="actions"><button class="again">New numbers, try again</button></div>' +
+      '</div>';
+    cardsEl.appendChild(s);
+
+    var gEl = s.querySelector('.g'), rvBtn = s.querySelector('.rv'), teachEl = s.querySelector('.teach');
+    var inputEls = s.querySelectorAll('.inputs input');
+    var rec = store[card.id] || { attempts: [], teach: '' };
+    teachEl.value = rec.teach || '';
+
+    function values() {
+      var v = {};
+      Array.prototype.forEach.call(inputEls, function (el) { v[el.dataset.k] = parseFloat(el.value) || 0; });
+      return v;
+    }
+    function render(res, guess) {
+      var err = guess - res.answer;
+      var stats = res.stats.map(function (st, j) {
+        return '<div class="stat' + (j === 0 ? ' main' : '') + '"><b>' + st[0] + '</b><span>' + st[1] + '</span></div>';
+      }).join('');
+      stats += '<div class="stat"><b>Your guess</b><span>' + guess + '</span></div>' +
+        '<div class="stat err"><b>Your error</b><span>' + (err > 0 ? '+' : '') + fmt(err, 2) + '</span></div>' +
+        '<div class="stat err"><b>Calibration</b><span>' + calibration(guess, res.answer) + '/100</span></div>';
+      s.querySelector('.result').innerHTML = stats;
+      s.querySelector('.formula').textContent = res.formula;
+      s.querySelector('.mistake').innerHTML = '<b>Mistake review.</b> ' + res.mistake;
+      s.querySelector('.theory').innerHTML = '<b>Theory.</b> ' + res.theory;
+    }
+    function lock(on) {
+      s.classList.toggle('revealed', on);
+      gEl.disabled = on;
+      Array.prototype.forEach.call(inputEls, function (el) { el.disabled = on; });
+      rvBtn.disabled = on || gEl.value === '';
+    }
+
+    gEl.addEventListener('input', function () { rvBtn.disabled = gEl.value === ''; });
+    gEl.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !rvBtn.disabled) rvBtn.click(); });
+    rvBtn.addEventListener('click', function () {
+      var guess = parseFloat(gEl.value);
+      if (isNaN(guess)) { showToast('Type a guess first. Act before you learn.'); return; }
+      var v = values(), res = solve(card.id, v);
+      render(res, guess);
+      lock(true);
+      rec.attempts.push({ guess: guess, answer: res.answer, score: calibration(guess, res.answer), inputs: v, work: s.querySelector('.work').value, t: Date.now() });
+      store[card.id] = rec; save(STORE_KEY, store);
+      markNav(); renderSummary();
+    });
+    teachEl.addEventListener('input', function () { rec.teach = teachEl.value; store[card.id] = rec; save(STORE_KEY, store); });
+    s.querySelector('.again').addEventListener('click', function () {
+      var nv = card.rand();
+      Array.prototype.forEach.call(inputEls, function (el) { if (nv[el.dataset.k] !== undefined) el.value = nv[el.dataset.k]; });
+      gEl.value = ''; s.querySelector('.work').value = '';
+      lock(false); gEl.focus();
+    });
+
+    // Show the last attempt again after a reload
+    var last = rec.attempts[rec.attempts.length - 1];
+    if (last) {
+      Array.prototype.forEach.call(inputEls, function (el) { if (last.inputs[el.dataset.k] !== undefined) el.value = last.inputs[el.dataset.k]; });
+      gEl.value = last.guess; s.querySelector('.work').value = last.work || '';
+      render(solve(card.id, last.inputs), last.guess);
+      lock(true);
+    }
+  }
+
+  CARDS.forEach(buildCard);
+
+  function markNav() {
+    nav.innerHTML = '<a href="#c00">00 Goal</a>' + CARDS.map(function (c, i) {
+      var done = store[c.id] && store[c.id].attempts.length;
+      return '<a href="#' + c.id + '"' + (done ? ' class="done"' : '') + '>' + pad(i + 1) + ' ' + c.title.split(':')[0] + '</a>';
+    }).join('') + '<a href="#summary">Summary</a>';
+  }
+
+  function renderSummary() {
+    var rows = CARDS.map(function (c, i) {
+      var a = (store[c.id] && store[c.id].attempts) || [];
+      if (!a.length) return '<tr><td>' + pad(i + 1) + ' ' + c.title + '</td><td class="muted">–</td><td class="muted">–</td><td class="muted">–</td></tr>';
+      var first = a[0].score, lastS = a[a.length - 1].score;
+      return '<tr><td>' + pad(i + 1) + ' ' + c.title + '</td><td>' + a.length + '</td><td>' + first + '</td><td>' + lastS + '</td></tr>';
+    }).join('');
+    document.getElementById('scoreTable').innerHTML =
+      '<table><tr><th>Card</th><th>Tries</th><th>First score</th><th>Last score</th></tr>' + rows + '</table>' +
+      '<p class="muted">Calibration: 100 = exact guess. Look at the cards with the lowest first score. Re-do them with new numbers next session (Review).</p>';
+  }
+
+  markNav(); renderSummary();
+
+  // ---- Edit mode: free-text boxes (data-ed) ----
+  var editBtn = document.getElementById('editBtn'), cancelBtn = document.getElementById('cancelBtn');
+  var edEls = document.querySelectorAll('[data-ed]');
+  var notes = load(EDIT_KEY), before = {}, editing = false;
+  Array.prototype.forEach.call(edEls, function (el) { if (notes[el.id]) el.innerHTML = notes[el.id]; });
+
+  function setEditing(on) {
+    editing = on;
+    document.body.classList.toggle('editing', on);
+    Array.prototype.forEach.call(edEls, function (el) { el.setAttribute('contenteditable', on ? 'true' : 'false'); });
+    editBtn.textContent = on ? 'Save' : 'Edit';
+    cancelBtn.classList.toggle('hidden', !on);
+  }
+  editBtn.addEventListener('click', function () {
+    if (!editing) {
+      Array.prototype.forEach.call(edEls, function (el) { before[el.id] = el.innerHTML; });
+      setEditing(true); edEls[0].focus();
+    } else {
+      setEditing(false);
+      Array.prototype.forEach.call(edEls, function (el) { notes[el.id] = el.innerHTML; });
+      save(EDIT_KEY, notes); showToast('Saved in this browser.');
+    }
+  });
+  cancelBtn.addEventListener('click', function () {
+    Array.prototype.forEach.call(edEls, function (el) { el.innerHTML = before[el.id]; });
+    setEditing(false); showToast('Changes discarded.');
+  });
+
+  // Download: a copy of the page with your notes and attempts written in
+  document.getElementById('downloadBtn').addEventListener('click', function () {
+    if (editing) editBtn.click();
+    var clone = document.documentElement.cloneNode(true);
+    clone.querySelector('#cards').innerHTML = '';
+    clone.querySelector('body').classList.remove('editing');
+    var dump = clone.ownerDocument.createElement('script');
+    dump.textContent = 'try{if(!localStorage.getItem("' + STORE_KEY + '"))localStorage.setItem("' + STORE_KEY + '",' + JSON.stringify(JSON.stringify(store)) + ')}catch(e){}';
+    clone.querySelector('head').appendChild(dump);
+    var blob = new Blob(['<!doctype html>\n' + clone.outerHTML], { type: 'text/html' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'm01_expected_value.html';
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    showToast('Downloaded m01_expected_value.html');
+  });
+})();
+</script>
+</body></html>
