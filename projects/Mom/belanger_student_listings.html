@@ -1,0 +1,1480 @@
+<!doctype html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Bélanger — Student Housing Listings</title>
+<style>
+  :root {
+    --bg:#0e1014; --surface:#161920; --surface-2:#1d212b; --border:#272c38;
+    --text:#e4e7ec; --muted:#98a1b2; --accent:#7aa2f7; --accent-2:#9ece6a;
+    --warn:#e0af68; --danger:#f7768e; --radius:12px;
+  }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; scroll-padding-top:120px; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; -webkit-text-size-adjust:100%; }
+  header { position:sticky; top:0; z-index:10; background:rgba(14,16,20,.92); backdrop-filter:blur(8px); border-bottom:1px solid var(--border); }
+  .bar { max-width:860px; margin:0 auto; padding:12px 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .bar h1 { font-size:18px; margin:0; flex:1; min-width:160px; }
+  button { font:inherit; font-size:14px; font-weight:600; color:var(--text); background:var(--surface-2);
+    border:1px solid var(--border); border-radius:8px; padding:8px 12px; cursor:pointer; min-height:38px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#0e1014; border-color:var(--accent); }
+  button.danger:hover { border-color:var(--danger); color:var(--danger); }
+  button.hidden { display:none; }
+  nav { max-width:860px; margin:0 auto; display:flex; gap:6px; overflow-x:auto; padding:0 16px 10px; scrollbar-width:none; }
+  nav::-webkit-scrollbar { display:none; }
+  nav a { flex:none; font-size:13px; color:var(--muted); text-decoration:none; padding:5px 10px; border:1px solid var(--border); border-radius:999px; }
+  nav a:hover { color:var(--text); border-color:var(--accent); }
+  main { max-width:860px; margin:0 auto; padding:16px 16px 64px; }
+  section { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px 18px 14px; margin-bottom:16px; }
+  h2 { margin:0 0 10px; font-size:19px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  h2 .n { color:var(--accent); font-size:14px; font-weight:700; }
+  h3 { margin:16px 0 8px; font-size:15px; color:var(--accent-2); }
+  p { margin:0 0 10px; }
+  ul { margin:0 0 10px; padding-left:22px; } li { margin:4px 0; } li::marker { color:var(--accent); }
+  a { color:var(--accent); }
+  .muted { color:var(--muted); } .small { font-size:13.5px; }
+  code { font:13px ui-monospace,Menlo,monospace; background:var(--surface-2); border:1px solid var(--border); padding:1px 6px; border-radius:6px; }
+  blockquote { margin:10px 0; padding:10px 14px; border-left:3px solid var(--accent); background:var(--surface-2); border-radius:0 8px 8px 0; color:var(--muted); }
+  .pill { font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; border:1px solid var(--border); color:var(--muted); }
+  .pill.ok { color:var(--accent-2); border-color:var(--accent-2); }
+  .pill.mid { color:var(--warn); border-color:var(--warn); }
+  .pill.low { color:var(--danger); border-color:var(--danger); }
+
+  /* Form grid */
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px 12px; }
+  .f { display:flex; flex-direction:column; gap:4px; }
+  .f.wide { grid-column:1/-1; }
+  .f label { font-size:12.5px; color:var(--muted); font-weight:600; letter-spacing:.2px; }
+  .f label .req { color:var(--warn); }
+  .f .hint { font-size:12px; color:var(--muted); opacity:.8; }
+  input[type=text],input[type=number],input[type=date],input[type=email],input[type=tel],input[type=url],select,textarea {
+    font:inherit; font-size:15px; color:var(--text); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:8px; padding:8px 10px; width:100%; min-height:40px; }
+  textarea { min-height:110px; resize:vertical; line-height:1.45; }
+  input:focus,select:focus,textarea:focus { outline:none; border-color:var(--accent); }
+  input.empty-req, select.empty-req, textarea.empty-req { border-color:rgba(224,175,104,.55); }
+  .checks { display:flex; flex-wrap:wrap; gap:6px; }
+  .chk { display:inline-flex; align-items:center; gap:6px; font-size:14px; background:var(--surface-2); border:1px solid var(--border);
+    border-radius:999px; padding:5px 11px; cursor:pointer; user-select:none; }
+  .chk input { accent-color:var(--accent-2); margin:0; }
+  .chk:has(input:checked) { border-color:var(--accent-2); color:var(--accent-2); }
+
+  .tabs { display:flex; gap:6px; margin:0 0 12px; flex-wrap:wrap; }
+  .tabs button.on { border-color:var(--accent); color:var(--accent); }
+
+  /* Platforms table */
+  .tbl { width:100%; border-collapse:collapse; font-size:14px; }
+  .tbl th,.tbl td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .tbl th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .tbl select { min-height:34px; padding:4px 6px; font-size:13.5px; }
+  @media (max-width:600px){ .tbl .hide-sm{ display:none; } }
+
+  .checklist { list-style:none; padding:0; margin:0 0 10px; display:grid; gap:6px; }
+  .checklist li { margin:0; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:9px 12px; display:flex; gap:10px; align-items:flex-start; }
+  .checklist input { accent-color:var(--accent-2); width:18px; height:18px; margin-top:3px; flex:none; }
+  .checklist li:has(input:checked) { border-color:rgba(158,206,106,.5); }
+  .checklist li:has(input:checked) span { color:var(--muted); }
+
+  /* Result */
+  .meter { height:8px; background:var(--surface-2); border:1px solid var(--border); border-radius:999px; overflow:hidden; margin:6px 0 4px; }
+  .meter > div { height:100%; background:var(--accent-2); transition:width .2s; }
+  .big { font-size:28px; font-weight:800; letter-spacing:-.5px; }
+  pre.out { white-space:pre-wrap; word-break:break-word; background:var(--surface-2); border:1px solid var(--border); border-radius:10px;
+    padding:12px; font:14px/1.5 ui-monospace,Menlo,monospace; margin:0 0 10px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .missing { font-size:13.5px; color:var(--warn); }
+
+  /* Edit mode for static text */
+  body.editing .prose { outline:1px dashed var(--accent); outline-offset:4px; border-radius:4px; }
+  .banner { display:none; max-width:860px; margin:0 auto; padding:0 16px 10px; font-size:13px; color:var(--warn); }
+  body.editing .banner { display:block; }
+
+  .toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%) translateY(90px); background:var(--surface-2);
+    border:1px solid var(--accent); padding:10px 16px; border-radius:10px; font-size:14px; transition:transform .25s; z-index:20; max-width:calc(100% - 32px); }
+  .toast.show { transform:translateX(-50%) translateY(0); }
+  @media (max-width:480px){ body{font-size:15.5px;} section{padding:14px 14px 10px;} .bar h1{font-size:16px;} button{padding:7px 10px;font-size:13px;} }
+
+  /* Questions card */
+  .qa { display:grid; gap:10px; margin-bottom:12px; }
+  .q { background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+  .q h4 { margin:0 0 6px; font-size:15px; color:var(--warn); }
+  .q .ans { font-size:14.5px; }
+  .q .ans ul { margin:4px 0 0; }
+  .tag { display:inline-block; font-size:11.5px; font-weight:700; padding:1px 8px; border-radius:999px; margin-left:4px; vertical-align:middle; }
+  .tag.go { background:rgba(158,206,106,.15); color:var(--accent-2); }
+  .tag.wait { background:rgba(224,175,104,.15); color:var(--warn); }
+  .tag.stop { background:rgba(247,118,142,.15); color:var(--danger); }
+  .inv { overflow-x:auto; margin-bottom:8px; }
+  .inv table { min-width:640px; }
+  .inv input, .inv select { min-height:34px; padding:4px 6px; font-size:13.5px; }
+  .act { font-size:12.5px; font-weight:700; white-space:nowrap; }
+  .act.go { color:var(--accent-2); } .act.wait { color:var(--warn); } .act.prep { color:var(--accent); } .act.none { color:var(--muted); }
+  #printUnits { display:none; }
+
+  /* Print / PDF: light, clean, values only */
+  @media print {
+    @page { margin:14mm; }
+    :root { --bg:#fff; --surface:#fff; --surface-2:#f6f7f9; --border:#d9dde3; --text:#1b1f27; --muted:#5b6473; --accent:#2f5bd3; --accent-2:#2e7d32; --warn:#a15c00; --danger:#c62828; }
+    html, body { background:#fff !important; color:#1b1f27; font-size:12pt; color-scheme:light; }
+    ::placeholder { color:transparent !important; }
+    #invRows tr.blank { display:none; }
+    .inv table { min-width:0; font-size:10pt; }
+    .inv input, .inv select { font-size:10pt !important; width:100% !important; }
+    input[type=date]::-webkit-calendar-picker-indicator { display:none; }
+    .checklist { break-before:auto; }
+    .checklist li { break-inside:avoid; }
+    header { position:static; background:#fff; border:0; }
+    header button, nav, .banner, .toast, .tabs, .row button, #unitForm, #c04, #c06 { display:none !important; }
+    .bar h1 { font-size:20pt; }
+    main { max-width:none; padding:0; }
+    section { break-inside:avoid; page-break-inside:avoid; border-color:#d9dde3; }
+    #c03, #cq { break-inside:auto; page-break-inside:auto; }
+    .q, .checklist li, tr { break-inside:avoid; }
+    input:not([type=checkbox]), select, textarea { border:0 !important; background:transparent !important; padding:0 !important; min-height:0 !important; color:#1b1f27; -webkit-appearance:none; appearance:none; }
+    .chk:not(:has(input:checked)) { display:none; }
+    .chk { border:0; padding:0 8px 0 0; background:none; }
+    .meter { border-color:#bbb; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    .meter > div { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    #printUnits { display:block; }
+    #printUnits pre.out { background:#fff; font-size:10.5pt; }
+    a { color:#2f5bd3; text-decoration:none; }
+  }
+</style>
+<link type="text/css" rel="stylesheet" id="dark-mode-custom-link"><link type="text/css" rel="stylesheet" id="dark-mode-general-link"><style lang="en" type="text/css" id="dark-mode-custom-style"></style><style lang="en" type="text/css" id="dark-mode-native-style"></style><style lang="en" type="text/css" id="dark-mode-native-sheet"></style></head>
+<body id="artifacts-component-root-html">
+<header>
+  <div class="bar">
+    <h1>Bélanger · Student Listings</h1>
+    <button id="editBtn">Edit text</button>
+    <button id="printBtn">Print / PDF</button>
+    <button id="downloadBtn" class="primary">Download</button>
+    <button id="resetBtn" class="danger">Reset</button>
+  </div>
+  <div class="banner">Edit mode: tap the dashed text to change it. Tap "Save text" when done. The form fields save automatically.</div>
+  <nav>
+    <a href="#cq" style="border-color:var(--warn);color:var(--warn)">Q Questions</a>
+    <a href="#c00">00 Goal</a>
+    <a href="#c01">01 Where</a>
+    <a href="#c02">02 Contact</a>
+    <a href="#c03">03 Units</a>
+    <a href="#c04">04 Photos</a>
+    <a href="#c05">05 Rules</a>
+    <a href="#c06">06 Listing text</a>
+    <a href="#c07">07 Questions</a>
+  </nav>
+</header>
+
+<main id="content">
+
+  <!-- CARD Q: questions before the goal -->
+  <section id="cq">
+    <h2><span class="n" style="color:var(--warn)">Q</span> Questions first</h2>
+    <div class="qa prose" data-prose="qa">
+      <div class="q">
+        <h4>1. Which units do we list?</h4>
+        <div class="ans">
+          <p>List the units that are <b>vacant now</b>, and the units where the tenant has said they will <b>leave at the end of the lease</b>. 12 units at about 80% occupancy = about 2–3 vacant units.</p>
+          <ul>
+            <li>Fill in the unit table below. The <b>Action</b> column tells you what to do with each unit.</li>
+            <li>Most Quebec leases end June 30. Tenants usually send their "I will not renew" notice 3 to 6 months before. Units leaving July 1 can go on the list in the spring.</li>
+            <li>Students look for housing hardest for January (now) and for July 1 / September.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="q">
+        <h4>2. Where do we get photos?</h4>
+        <div class="ans">
+          <p><span class="tag stop">Do not copy</span> the Centris / Realtor.ca photos. The photographer or the broker owns them. The OACIQ (Quebec broker regulator) says you need the <b>photographer's written permission</b> to use them again.</p>
+          <ul>
+            <li><span class="tag go">Best, free</span> Take your own phone photos of the vacant units in daylight. Use the shot list in Card 04.</li>
+            <li><span class="tag wait">Ask</span> Ask Kai Yuan for the photos <b>and</b> a written OK (an email is enough) from the photographer.</li>
+            <li>Optional: hire a photographer once, and get a contract that says you can use the photos anywhere.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="q">
+        <h4>3. Can we post now, or wait for the Kai Yuan contract to end?</h4>
+        <div class="ans">
+          <p>It depends on the <b>contract you signed</b>. Find it and read 3 things: the <b>end date</b>, whether it says <b>"exclusive"</b>, and the clause that says <b>when commission is owed</b>.</p>
+          <ul>
+            <li><span class="tag go">Not in the contract</span> The units Kai Yuan does not list: you can post them now.</li>
+            <li><span class="tag wait">Exclusive contract</span> You can usually post too, but the broker can still get the commission if you sign a lease during the contract. The OACIQ residential lease form also keeps commission owed if you sign, in the <b>180 days after the end</b>, with a person who was interested during the contract.</li>
+            <li><span class="tag go">Easy fix</span> Ask Kai Yuan to amend the contract so you can also market the units (the OACIQ explains how to make it non-exclusive). Get it in writing.</li>
+            <li class="muted">I am not a lawyer. Free OACIQ info line: 1-800-440-7170.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="q">
+        <h4>4. Can I make accounts and prep now?</h4>
+        <div class="ans">
+          <p><span class="tag go">Yes</span> Accounts, drafts, photos and texts are prep, not advertising. Do everything below now. Only <b>publish</b> a unit under the Kai Yuan contract after question 3 is clear.</p>
+          <p class="muted small">Claude cannot make the accounts for you: each site checks your own email and phone. Each one takes about 5 minutes.</p>
+        </div>
+      </div>
+    </div>
+
+    <h3>Unit table (12 units)</h3>
+    <div class="inv"><table class="tbl">
+      <thead><tr><th>Unit</th><th>Building</th><th>Size</th><th>Status</th><th>Lease ends</th><th>On Kai Yuan contract?</th><th>Rent</th><th>Action</th></tr></thead>
+      <tbody id="invRows"><tr><td><input type="text" data-path="inventory.0.unit" value="Apt 1" placeholder="#1"></td><td><select data-path="inventory.0.bldg"><option value="">—</option><option value="1835 Bélanger" selected="">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.0.size" value="2 bd / 2 ba" placeholder="4½"></td><td><select data-path="inventory.0.status"><option value="">—</option><option value="Vacant" selected="">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.0.end" value=""></td><td><select data-path="inventory.0.broker"><option value="">—</option><option value="No">No</option><option value="Yes – Kai Yuan" selected="">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.0.rent" value="1790" style="width:90px"></td><td class="act wait" id="act0">Check contract (Q3)</td></tr><tr><td><input type="text" data-path="inventory.1.unit" value="" placeholder="#2"></td><td><select data-path="inventory.1.bldg"><option value="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger" selected="">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.1.size" value="" placeholder="4½"></td><td><select data-path="inventory.1.status"><option value="">—</option><option value="Vacant" selected="">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.1.end" value=""></td><td><select data-path="inventory.1.broker"><option value="">—</option><option value="No">No</option><option value="Yes – Kai Yuan" selected="">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.1.rent" value="" style="width:90px"></td><td class="act wait" id="act1">Check contract (Q3)</td></tr><tr class="blank"><td><input type="text" data-path="inventory.2.unit" value="" placeholder="#3"></td><td><select data-path="inventory.2.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.2.size" value="" placeholder="4½"></td><td><select data-path="inventory.2.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.2.end" value=""></td><td><select data-path="inventory.2.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.2.rent" value="" style="width:90px"></td><td class="act none" id="act2"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.3.unit" value="" placeholder="#4"></td><td><select data-path="inventory.3.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.3.size" value="" placeholder="4½"></td><td><select data-path="inventory.3.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.3.end" value=""></td><td><select data-path="inventory.3.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.3.rent" value="" style="width:90px"></td><td class="act none" id="act3"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.4.unit" value="" placeholder="#5"></td><td><select data-path="inventory.4.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.4.size" value="" placeholder="4½"></td><td><select data-path="inventory.4.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.4.end" value=""></td><td><select data-path="inventory.4.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.4.rent" value="" style="width:90px"></td><td class="act none" id="act4"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.5.unit" value="" placeholder="#6"></td><td><select data-path="inventory.5.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.5.size" value="" placeholder="4½"></td><td><select data-path="inventory.5.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.5.end" value=""></td><td><select data-path="inventory.5.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.5.rent" value="" style="width:90px"></td><td class="act none" id="act5"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.6.unit" value="" placeholder="#7"></td><td><select data-path="inventory.6.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.6.size" value="" placeholder="4½"></td><td><select data-path="inventory.6.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.6.end" value=""></td><td><select data-path="inventory.6.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.6.rent" value="" style="width:90px"></td><td class="act none" id="act6"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.7.unit" value="" placeholder="#8"></td><td><select data-path="inventory.7.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.7.size" value="" placeholder="4½"></td><td><select data-path="inventory.7.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.7.end" value=""></td><td><select data-path="inventory.7.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.7.rent" value="" style="width:90px"></td><td class="act none" id="act7"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.8.unit" value="" placeholder="#9"></td><td><select data-path="inventory.8.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.8.size" value="" placeholder="4½"></td><td><select data-path="inventory.8.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.8.end" value=""></td><td><select data-path="inventory.8.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.8.rent" value="" style="width:90px"></td><td class="act none" id="act8"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.9.unit" value="" placeholder="#10"></td><td><select data-path="inventory.9.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.9.size" value="" placeholder="4½"></td><td><select data-path="inventory.9.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.9.end" value=""></td><td><select data-path="inventory.9.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.9.rent" value="" style="width:90px"></td><td class="act none" id="act9"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.10.unit" value="" placeholder="#11"></td><td><select data-path="inventory.10.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.10.size" value="" placeholder="4½"></td><td><select data-path="inventory.10.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.10.end" value=""></td><td><select data-path="inventory.10.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.10.rent" value="" style="width:90px"></td><td class="act none" id="act10"></td></tr><tr class="blank"><td><input type="text" data-path="inventory.11.unit" value="" placeholder="#12"></td><td><select data-path="inventory.11.bldg"><option value="" selected="">—</option><option value="1835 Bélanger">1835 Bélanger</option><option value="1832 Bélanger">1832 Bélanger</option><option value="Other">Other</option></select></td><td><input type="text" data-path="inventory.11.size" value="" placeholder="4½"></td><td><select data-path="inventory.11.status"><option value="" selected="">—</option><option value="Vacant">Vacant</option><option value="Leaving (notice given)">Leaving (notice given)</option><option value="Lease ends ≤ 6 months">Lease ends ≤ 6 months</option><option value="Occupied">Occupied</option></select></td><td><input type="date" data-path="inventory.11.end" value=""></td><td><select data-path="inventory.11.broker"><option value="" selected="">—</option><option value="No">No</option><option value="Yes – Kai Yuan">Yes – Kai Yuan</option><option value="Not sure">Not sure</option></select></td><td><input type="number" data-path="inventory.11.rent" value="" style="width:90px"></td><td class="act none" id="act11"></td></tr></tbody>
+    </table></div>
+    <p class="muted small" id="invSummary">2/12 rows filled · 2 vacant · 0 leaving soon · 0 can be listed now · 2 wait for the contract check</p>
+
+    <h3>Prep now (no posting needed)</h3>
+    <ul class="checklist" id="prepList"><li><input type="checkbox" data-path="prep.0" data-bool="1"><span>Find the Kai Yuan contract. Write down: end date, "exclusive" yes/no, the commission clause, which units it covers.</span></li><li><input type="checkbox" data-path="prep.1" data-bool="1"><span>Ask Kai Yuan: "Can I also post on student sites?" and "Can I use the photos, with the photographer's written OK?"</span></li><li><input type="checkbox" data-path="prep.2" data-bool="1"><span>Fill in the unit table above (12 rows).</span></li><li><input type="checkbox" data-path="prep.3" data-bool="1"><span>Make a Places4Students landlord account (McGill). Do not publish yet.</span></li><li><input type="checkbox" data-path="prep.4" data-bool="1"><span>Make a CSU HOJO Classifieds account (Concordia).</span></li><li><input type="checkbox" data-path="prep.5" data-bool="1"><span>Join the Facebook group "McGill Off-Campus Housing".</span></li><li><input type="checkbox" data-path="prep.6" data-bool="1"><span>Make a liv.rent landlord account.</span></li><li><input type="checkbox" data-path="prep.7" data-bool="1"><span>Take your own photos of each vacant unit (shot list in Card 04).</span></li><li><input type="checkbox" data-path="prep.8" data-bool="1"><span>Fill in Card 02 (contact) and Card 03 (unit facts) for each vacant unit.</span></li></ul>
+  </section>
+
+  <!-- CARD 00 -->
+  <section id="c00">
+    <h2><span class="n">00</span> Goal</h2>
+    <div class="prose" data-prose="goal">
+      <p>Both Bélanger units are live on <b>Places4Students</b> (the McGill off-campus listing service), plus the free student channels, with one clean listing text per unit.</p>
+      <p class="muted small">Plan backward: listing text (06) ← unit facts (03) + contact (02) + photos (04) + Quebec rules check (05) ← where to post (01).</p>
+    </div>
+    <div class="grid" id="statusTiles"><div class="f" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px"><span class="muted small">Unit A · 1835 Rue Bélanger</span><span class="big">67%</span><div class="meter"><div style="width:67%"></div></div><span class="muted small">Posted on 0/5 platforms</span></div><div class="f" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px"><span class="muted small">Unit B · 1832 Rue Bélanger</span><span class="big">33%</span><div class="meter"><div style="width:33%"></div></div><span class="muted small">Posted on 0/5 platforms</span></div><div class="f" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px"><span class="muted small">Quebec rules check</span><span class="big">0/9</span><div class="meter"><div style="width:0%"></div></div><span class="muted small">Card 05</span></div></div>
+  </section>
+
+  <!-- CARD 01 -->
+  <section id="c01">
+    <h2><span class="n">01</span> Where to post</h2>
+    <div class="prose" data-prose="where">
+      <p class="small">McGill does not take landlord listings directly. It sends students to Places4Students. Places4Students fees change by school (free at some schools, about $28–$53 per 28-day listing at others). Check the McGill price when you register.</p>
+    </div>
+    <table class="tbl">
+      <thead><tr><th>Platform</th><th class="hide-sm">Cost / note</th><th>Unit A</th><th>Unit B</th></tr></thead>
+      <tbody id="platformRows"><tr><td><a href="https://www.places4students.com/Places/School?SchoolID=vl6PUH8EBtg%3d" target="_blank" rel="noopener">Places4Students (McGill portal)</a><div class="muted small" style="display:none" data-sm="">Main channel. Paid or free, check at sign-up.</div></td><td class="hide-sm muted small">Main channel. Paid or free, check at sign-up.</td><td><select data-path="platforms.p4s_0"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td><td><select data-path="platforms.p4s_1"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td></tr><tr><td><a href="https://classifieds.csu.qc.ca/en/" target="_blank" rel="noopener">Concordia CSU HOJO Classifieds</a><div class="muted small" style="display:none" data-sm="">Moderated by HOJO staff. Reaches Concordia students.</div></td><td class="hide-sm muted small">Moderated by HOJO staff. Reaches Concordia students.</td><td><select data-path="platforms.hojo_0"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td><td><select data-path="platforms.hojo_1"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td></tr><tr><td>Facebook: "McGill Off-Campus Housing" group<div class="muted small" style="display:none" data-sm="">~53k members. Free. Search the group name.</div></td><td class="hide-sm muted small">~53k members. Free. Search the group name.</td><td><select data-path="platforms.fb_0"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td><td><select data-path="platforms.fb_1"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td></tr><tr><td><a href="https://liv.rent" target="_blank" rel="noopener">liv.rent</a><div class="muted small" style="display:none" data-sm="">ID-verified landlords. Has McGill area pages.</div></td><td class="hide-sm muted small">ID-verified landlords. Has McGill area pages.</td><td><select data-path="platforms.liv_0"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td><td><select data-path="platforms.liv_1"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td></tr><tr><td>Kijiji / Kangalou / Rentals.ca<div class="muted small" style="display:none" data-sm="">General boards that the McGill guide lists.</div></td><td class="hide-sm muted small">General boards that the McGill guide lists.</td><td><select data-path="platforms.kij_0"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td><td><select data-path="platforms.kij_1"><option selected="">—</option><option>To do</option><option>Drafted</option><option>Posted</option><option>Rented</option></select></td></tr></tbody>
+    </table>
+    <p class="muted small" style="margin-top:8px">Places4Students support: 1-866-766-0767 · admin@places4students.com · McGill off-campus office: offcampus.housing@mcgill.ca</p>
+  </section>
+
+  <!-- CARD 02 -->
+  <section id="c02">
+    <h2><span class="n">02</span> Contact info <span class="pill">shared by both units</span></h2>
+    <div class="grid" id="contactForm"><div class="f"><label for="contact_name">Name shown on listing <span class="req">*</span></label><input type="text" id="contact_name" data-path="contact.name" value="Krista Guo"></div><div class="f"><label for="contact_role">You are the… <span class="req">*</span></label><select id="contact_role" data-path="contact.role"><option value="">Select…</option><option selected="" value="Owner">Owner</option><option value="Broker">Broker</option><option value="Property manager">Property manager</option><option value="Owner rep (family)">Owner rep (family)</option></select></div><div class="f"><label for="contact_phone">Phone <span class="req">*</span></label><input type="tel" id="contact_phone" data-path="contact.phone" value="5149166398"></div><div class="f"><label for="contact_email">Email <span class="req">*</span></label><input type="email" id="contact_email" data-path="contact.email" value="lsg@hotmail.ca"></div><div class="f"><label for="contact_pref">Best way to reach you</label><select id="contact_pref" data-path="contact.pref"><option value="">Select…</option><option selected="" value="Text">Text</option><option value="Call">Call</option><option value="Email">Email</option><option value="Any">Any</option></select></div><div class="f"><label for="contact_lang">Languages</label><input type="text" id="contact_lang" data-path="contact.lang" value="English, French, Mandarin"><span class="hint">e.g. English, French, Mandarin</span></div><div class="f wide"><label for="contact_viewings">Viewing times</label><input type="text" id="contact_viewings" data-path="contact.viewings" value=""><span class="hint">e.g. Weeknights 6–8 pm, Sat 10–2</span></div></div>
+  </section>
+
+  <!-- CARD 03 -->
+  <section id="c03">
+    <h2><span class="n">03</span> Unit details <span class="pill mid" id="unitPill">Unit A: 67% ready</span></h2>
+    <p class="muted small prose" data-prose="units">Fields with <span style="color:var(--warn)">*</span> are the minimum for a good student listing. Unit A is pre-filled from Centris. The Realtor.ca page for Unit B did not load, so fill it from the broker sheet.</p>
+    <div class="tabs" id="unitTabs"><button type="button" data-tab="unit" data-i="0" class="on">Unit A · 1835 Rue Bélanger</button><button type="button" data-tab="unit" data-i="1" class="">Unit B · 1832 Rue Bélanger</button></div>
+    <div id="unitForm"><h3>Basics</h3><div class="grid"><div class="f"><label for="units_0_address">Street address <span class="req">*</span></label><input type="text" id="units_0_address" data-path="units.0.address" value="1835 Rue Bélanger"></div><div class="f"><label for="units_0_unit">Apt #</label><input type="text" id="units_0_unit" data-path="units.0.unit" value="1"></div><div class="f"><label for="units_0_postal">Postal code</label><input type="text" id="units_0_postal" data-path="units.0.postal" value="H2G1B3"><span class="hint">Look up on Canada Post</span></div><div class="f"><label for="units_0_area">Neighbourhood <span class="req">*</span></label><input type="text" id="units_0_area" data-path="units.0.area" value="Villeray (Villeray–Saint-Michel–Parc-Extension)"></div><div class="f"><label for="units_0_qcSize">Quebec size <span class="req">*</span></label><input type="text" id="units_0_qcSize" data-path="units.0.qcSize" value="" class="empty-req"><span class="hint">e.g. 4½, 5½ (students search by this)</span></div><div class="f"><label for="units_0_beds">Bedrooms <span class="req">*</span></label><input type="number" id="units_0_beds" data-path="units.0.beds" value="2"></div><div class="f"><label for="units_0_bedNote">Bedroom note</label><input type="text" id="units_0_bedNote" data-path="units.0.bedNote" value="1 bedroom in the basement"><span class="hint">e.g. 1 bedroom in basement</span></div><div class="f"><label for="units_0_baths">Bathrooms <span class="req">*</span></label><input type="number" id="units_0_baths" data-path="units.0.baths" value="2"></div><div class="f"><label for="units_0_sqft">Area (sq ft)</label><input type="number" id="units_0_sqft" data-path="units.0.sqft" value=""></div><div class="f"><label for="units_0_floor">Floor</label><input type="text" id="units_0_floor" data-path="units.0.floor" value=""><span class="hint">e.g. Ground + basement</span></div><div class="f"><label for="units_0_year">Year built</label><input type="number" id="units_0_year" data-path="units.0.year" value="2025"></div></div><h3>Money &amp; dates</h3><div class="grid"><div class="f"><label for="units_0_rent">Rent ($/month) <span class="req">*</span></label><input type="number" id="units_0_rent" data-path="units.0.rent" value="1790"></div><div class="f"><label for="units_0_avail">Available from <span class="req">*</span></label><input type="date" id="units_0_avail" data-path="units.0.avail" value="" class="empty-req"></div><div class="f"><label for="units_0_term">Lease type <span class="req">*</span></label><select id="units_0_term" data-path="units.0.term" class="empty-req"><option selected="" value="">Select…</option><option value="12-month lease">12-month lease</option><option value="Lease to June 30">Lease to June 30</option><option value="Lease transfer">Lease transfer</option><option value="Sublet">Sublet</option><option value="Flexible">Flexible</option></select></div><div class="f"><label for="units_0_furn">Furnished <span class="req">*</span></label><select id="units_0_furn" data-path="units.0.furn" class="empty-req"><option selected="" value="">Select…</option><option value="Unfurnished">Unfurnished</option><option value="Semi-furnished">Semi-furnished</option><option value="Furnished">Furnished</option></select></div><div class="f wide"><label for="units_0_incl">Included in rent <span class="req">*</span></label><div class="checks"><label class="chk"><input type="checkbox" data-path="units.0.incl" data-opt="Heat" checked="">Heat</label><label class="chk"><input type="checkbox" data-path="units.0.incl" data-opt="Hot water" checked="">Hot water</label><label class="chk"><input type="checkbox" data-path="units.0.incl" data-opt="Electricity" checked="">Electricity</label><label class="chk"><input type="checkbox" data-path="units.0.incl" data-opt="Internet" checked="">Internet</label><label class="chk"><input type="checkbox" data-path="units.0.incl" data-opt="Snow removal">Snow removal</label><label class="chk"><input type="checkbox" data-path="units.0.inclNone" data-bool="1">Nothing included</label></div></div></div><h3>Inside</h3><div class="grid"><div class="f wide"><label for="units_0_appl">Appliances</label><div class="checks"><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Fridge" checked="">Fridge</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Stove" checked="">Stove</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Dishwasher">Dishwasher</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Microwave">Microwave</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Washer">Washer</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Dryer">Dryer</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="W/D hookups">W/D hookups</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Air conditioning" checked="">Air conditioning</label><label class="chk"><input type="checkbox" data-path="units.0.appl" data-opt="Heat pump" checked="">Heat pump</label></div></div><div class="f wide"><label for="units_0_feat">Features</label><div class="checks"><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Balcony">Balcony</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Yard / terrace">Yard / terrace</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Storage">Storage</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Elevator">Elevator</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Bike storage">Bike storage</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Hardwood floors">Hardwood floors</label><label class="chk"><input type="checkbox" data-path="units.0.feat" data-opt="Brand-new building" checked="">Brand-new building</label></div></div></div><h3>Rules</h3><div class="grid"><div class="f"><label for="units_0_pets">Pets</label><select id="units_0_pets" data-path="units.0.pets"><option value="">Select…</option><option selected="" value="No pets">No pets</option><option value="Cats OK">Cats OK</option><option value="Pets with conditions">Pets with conditions</option><option value="Pets OK">Pets OK</option></select></div><div class="f"><label for="units_0_smoke">Smoking</label><select id="units_0_smoke" data-path="units.0.smoke"><option value="">Select…</option><option selected="" value="No smoking">No smoking</option><option value="Outside only">Outside only</option><option value="Allowed">Allowed</option></select></div><div class="f"><label for="units_0_parking">Parking</label><select id="units_0_parking" data-path="units.0.parking"><option value="">Select…</option><option selected="" value="None (street, permit zone)">None (street, permit zone)</option><option value="Outdoor spot">Outdoor spot</option><option value="Indoor spot">Indoor spot</option><option value="Garage">Garage</option></select></div><div class="f"><label for="units_0_parkFee">Parking fee ($/mo)</label><input type="number" id="units_0_parkFee" data-path="units.0.parkFee" value=""><span class="hint">0 if included</span></div></div><h3>Location (students care most)</h3><div class="grid"><div class="f"><label for="units_0_metro">Nearest metro <span class="req">*</span></label><input type="text" id="units_0_metro" data-path="units.0.metro" value="Fabre (blue line), D'Iberville close by"></div><div class="f"><label for="units_0_metroMin">Walk to metro (min)</label><input type="number" id="units_0_metroMin" data-path="units.0.metroMin" value="2"></div><div class="f"><label for="units_0_commute">Transit to McGill (min) <span class="req">*</span></label><input type="number" id="units_0_commute" data-path="units.0.commute" value="45"><span class="hint">Google Maps, transit, to 845 Sherbrooke W</span></div><div class="f wide"><label for="units_0_nearby">Nearby</label><input type="text" id="units_0_nearby" data-path="units.0.nearby" value="Grocery stores, cafés, restaurants, schools, parks. Walk Score 94."><span class="hint">grocery, Jarry Park, Jean-Talon Market…</span></div></div><h3>Description &amp; source</h3><div class="grid"><div class="f wide"><label for="units_0_desc">Your own description (2–4 lines) <span class="req">*</span></label><textarea id="units_0_desc" data-path="units.0.desc" class="empty-req"></textarea><span class="hint">What makes it nice to live in. The listing card (06) adds the facts.</span></div><div class="f wide"><label for="units_0_src">Source listing</label><input type="url" id="units_0_src" data-path="units.0.src" value="https://www.centris.ca/en/condos-apartments~for-rent~montreal-villeray-saint-michel-parc-extension/13852670"></div></div></div>
+    <div id="printUnits"><h3>Unit A · 1835 Rue Bélanger</h3><pre class="out"><b>2-bedroom · $1,790/mo · Villeray · near Fabre metro · new building</b>
+
+THE BASICS
+- Address: 1835 Rue Bélanger, apt 1, Montréal, H2G1B3
+- Neighbourhood: Villeray (Villeray–Saint-Michel–Parc-Extension)
+- Size: 2 bedrooms (1 bedroom in the basement), 2 bathrooms
+- Built: 2025
+
+RENT &amp; LEASE
+- Rent: $1,790 per month
+- Included: Heat, Hot water, Electricity, Internet
+
+INSIDE
+- Appliances: Fridge, Stove, Air conditioning, Heat pump
+- Features: Brand-new building
+
+LOCATION
+- Metro: Fabre (blue line), D'Iberville close by (2 min walk)
+- About 45 min by transit to McGill downtown campus
+- Nearby: Grocery stores, cafés, restaurants, schools, parks. Walk Score 94.
+
+RULES
+- No pets
+- No smoking
+- Parking: None (street, permit zone)
+
+CONTACT
+- Krista Guo (owner)
+- Phone: 5149166398 (text preferred)
+- Email: lsg@hotmail.ca
+- Languages: English, French, Mandarin
+Students welcome. Co-signer accepted.</pre><h3>Unit B · 1832 Rue Bélanger</h3><pre class="out"><b>La Petite-Patrie</b>
+
+THE BASICS
+- Address: 1832 Rue Bélanger, Montréal
+- Neighbourhood: La Petite-Patrie (Rosemont–La Petite-Patrie)
+
+RENT &amp; LEASE
+- Included: nothing; tenant pays electricity/heat (Hydro-Québec) and internet
+
+CONTACT
+- Krista Guo (owner)
+- Phone: 5149166398 (text preferred)
+- Email: lsg@hotmail.ca
+- Languages: English, French, Mandarin
+Students welcome. Co-signer accepted.</pre></div>
+  </section>
+
+  <!-- CARD 04 -->
+  <section id="c04">
+    <h2><span class="n">04</span> Photos &amp; media</h2>
+    <p class="small muted prose" data-prose="photos">Students skip listings with few photos. Shoot in daylight, landscape, lights on. Order: living room → kitchen → bedrooms → bathroom → building front → street / metro.</p>
+    <div class="tabs" id="photoTabs"><button type="button" data-tab="photo" data-i="0" class="on">Unit A · 1835 Rue Bélanger</button><button type="button" data-tab="photo" data-i="1" class="">Unit B · 1832 Rue Bélanger</button></div>
+    <ul class="checklist" id="photoList"><li><input type="checkbox" data-path="photos.0.0" data-bool="1"><span>Living room (2 angles)</span></li><li><input type="checkbox" data-path="photos.0.1" data-bool="1"><span>Kitchen + appliances</span></li><li><input type="checkbox" data-path="photos.0.2" data-bool="1"><span>Each bedroom</span></li><li><input type="checkbox" data-path="photos.0.3" data-bool="1"><span>Each bathroom</span></li><li><input type="checkbox" data-path="photos.0.4" data-bool="1"><span>Basement bedroom with window (if any)</span></li><li><input type="checkbox" data-path="photos.0.5" data-bool="1"><span>Building front</span></li><li><input type="checkbox" data-path="photos.0.6" data-bool="1"><span>Balcony / yard</span></li><li><input type="checkbox" data-path="photos.0.7" data-bool="1"><span>Floor plan (sketch is OK)</span></li><li><input type="checkbox" data-path="photos.0.8" data-bool="1"><span>Short video walk-through (optional)</span></li></ul>
+  </section>
+
+  <!-- CARD 05 -->
+  <section id="c05">
+    <h2><span class="n">05</span> Quebec rules check</h2>
+    <p class="small muted prose" data-prose="rules">Check each line before you post. Students read these rules in the McGill renting guide, so a listing that follows them looks more trustworthy.</p>
+    <ul class="checklist" id="rulesList"><li><input type="checkbox" data-path="rules.0" data-bool="1"><span>No deposit asked. A deposit is illegal in Quebec. First month rent at lease signing is normal.</span></li><li><input type="checkbox" data-path="rules.1" data-bool="1"><span>The application does not ask for SIN, credit card, passport number, or citizenship.</span></li><li><input type="checkbox" data-path="rules.2" data-bool="1"><span>No wording that excludes people by origin, sex, religion, age, student or international status, etc.</span></li><li><input type="checkbox" data-path="rules.3" data-bool="1"><span>Use the mandatory TAL lease form (Tribunal administratif du logement).</span></li><li><input type="checkbox" data-path="rules.4" data-bool="1"><span>Building built in the last 5 years: fill in Section F of the lease (rent-increase exemption). Confirm the details with the TAL.</span></li><li><input type="checkbox" data-path="rules.5" data-bool="1"><span>If a broker has a brokerage contract on the unit: get the broker's OK before you post it yourself.</span></li><li><input type="checkbox" data-path="rules.6" data-bool="1"><span>Full street address in the listing. Students treat listings without an address as possible scams.</span></li><li><input type="checkbox" data-path="rules.7" data-bool="1"><span>Real photos of this unit only, not stock or model photos.</span></li><li><input type="checkbox" data-path="rules.8" data-bool="1"><span>A co-signer (guarantor) request is OK. Say so in the listing if you need one.</span></li></ul>
+  </section>
+
+  <!-- CARD 06 -->
+  <section id="c06">
+    <h2><span class="n">06</span> Listing text <span class="pill">result</span></h2>
+    <div class="tabs" id="outTabs"><button type="button" data-tab="out" data-i="0" class="on">Unit A · 1835 Rue Bélanger</button><button type="button" data-tab="out" data-i="1" class="">Unit B · 1832 Rue Bélanger</button></div>
+    <div class="row">
+      <div style="flex:1;min-width:180px">
+        <div class="muted small">Ready to post</div>
+        <div class="big" id="outScore">67%</div>
+        <div class="meter"><div id="outMeter" style="width: 67%;"></div></div>
+      </div>
+      <button id="copyTitle">Copy title</button>
+      <button id="copyBody" class="primary">Copy description</button>
+    </div>
+    <div class="missing" id="outMissing">Missing: Quebec size · Available from · Lease type · Furnished · Your own description (2–4 lines) · Photos: 0/5 minimum</div>
+    <h3>Title</h3>
+    <pre class="out" id="outTitle">2-bedroom · $1,790/mo · Villeray · near Fabre metro · new building</pre>
+    <h3>Description</h3>
+    <pre class="out" id="outBody">THE BASICS
+- Address: 1835 Rue Bélanger, apt 1, Montréal, H2G1B3
+- Neighbourhood: Villeray (Villeray–Saint-Michel–Parc-Extension)
+- Size: 2 bedrooms (1 bedroom in the basement), 2 bathrooms
+- Built: 2025
+
+RENT &amp; LEASE
+- Rent: $1,790 per month
+- Included: Heat, Hot water, Electricity, Internet
+
+INSIDE
+- Appliances: Fridge, Stove, Air conditioning, Heat pump
+- Features: Brand-new building
+
+LOCATION
+- Metro: Fabre (blue line), D'Iberville close by (2 min walk)
+- About 45 min by transit to McGill downtown campus
+- Nearby: Grocery stores, cafés, restaurants, schools, parks. Walk Score 94.
+
+RULES
+- No pets
+- No smoking
+- Parking: None (street, permit zone)
+
+CONTACT
+- Krista Guo (owner)
+- Phone: 5149166398 (text preferred)
+- Email: lsg@hotmail.ca
+- Languages: English, French, Mandarin
+Students welcome. Co-signer accepted.</pre>
+  </section>
+
+  <!-- CARD 07 -->
+  <section id="c07">
+    <h2><span class="n">07</span> Open questions</h2>
+    <p class="small muted">Answer here. The answers change what the listing says.</p>
+    <div class="grid" id="questionForm"><div class="f wide"><label for="questions_q_who">User: Are you the owner, or the broker? Do Kai Yuan / Charisma hold an exclusive contract?</label><input type="text" id="questions_q_who" data-path="questions.q_who" value=""></div><div class="f wide"><label for="questions_q_same">User: Is Unit B (1832) the same type as Unit A (new 2025 build)? Same owner?</label><input type="text" id="questions_q_same" data-path="questions.q_same" value=""></div><div class="f"><label for="questions_q_split">User: Rent the whole unit only, or room by room to students?</label><select id="questions_q_split" data-path="questions.q_split"><option selected="" value="">Select…</option><option value="Whole unit only">Whole unit only</option><option value="Room by room OK">Room by room OK</option><option value="Either">Either</option></select></div><div class="f"><label for="questions_q_date">User: Target move-in (now / Jan 1 winter term / July 1)?</label><input type="text" id="questions_q_date" data-path="questions.q_date" value=""></div><div class="f"><label for="questions_q_budget">User: Max you want to spend on paid listings ($)?</label><input type="number" id="questions_q_budget" data-path="questions.q_budget" value=""></div><div class="f wide"><label for="questions_q_notes">User: Other notes</label><textarea id="questions_q_notes" data-path="questions.q_notes"></textarea></div></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<!-- Saved state. Download writes the current values here. -->
+<script type="application/json" id="savedState">{"contact":{"role":"Owner","name":"Krista Guo","phone":"5149166398","email":"lsg@hotmail.ca","pref":"Text","lang":"English, French, Mandarin"},"units":[{"tag":"A","address":"1835 Rue Bélanger","unit":"1","area":"Villeray (Villeray–Saint-Michel–Parc-Extension)","qcSize":"","beds":"2","bedNote":"1 bedroom in the basement","baths":"2","year":"2025","rent":"1790","metro":"Fabre (blue line), D'Iberville close by","feat":["Brand-new building"],"nearby":"Grocery stores, cafés, restaurants, schools, parks. Walk Score 94.","src":"https://www.centris.ca/en/condos-apartments~for-rent~montreal-villeray-saint-michel-parc-extension/13852670","postal":"H2G1B3","sqft":"","incl":["Heat","Hot water","Electricity","Internet"],"inclNone":false,"appl":["Fridge","Stove","Air conditioning","Heat pump"],"pets":"No pets","smoke":"No smoking","parking":"None (street, permit zone)","metroMin":"2","commute":"45"},{"tag":"B","address":"1832 Rue Bélanger","area":"La Petite-Patrie (Rosemont–La Petite-Patrie)","src":"https://www.realtor.ca/real-estate/30214814/1832-rue-belanger-montreal-rosemontla-petite-patrie-la-petite-patrie"}],"platforms":{},"photos":[{},{}],"rules":{"0":false},"questions":{},"prose":{},"ui":{"unit":0,"photo":0,"out":0},"inventory":[{"unit":"Apt 1","bldg":"1835 Bélanger","size":"2 bd / 2 ba","status":"Vacant","broker":"Yes – Kai Yuan","rent":"1790"},{"unit":"","bldg":"1832 Bélanger","status":"Vacant","broker":"Yes – Kai Yuan"},{},{},{},{},{},{},{},{},{},{}],"prep":{}}</script>
+
+<script>
+(function () {
+'use strict';
+var STORE_KEY = 'belanger_student_listings_v1';
+
+/* =========================================================
+   DATA
+   ========================================================= */
+var PLATFORMS = [
+  { id:'p4s', name:'Places4Students (McGill portal)', url:'https://www.places4students.com/Places/School?SchoolID=vl6PUH8EBtg%3d', note:'Main channel. Paid or free, check at sign-up.' },
+  { id:'hojo', name:'Concordia CSU HOJO Classifieds', url:'https://classifieds.csu.qc.ca/en/', note:'Moderated by HOJO staff. Reaches Concordia students.' },
+  { id:'fb', name:'Facebook: "McGill Off-Campus Housing" group', url:'', note:'~53k members. Free. Search the group name.' },
+  { id:'liv', name:'liv.rent', url:'https://liv.rent', note:'ID-verified landlords. Has McGill area pages.' },
+  { id:'kij', name:'Kijiji / Kangalou / Rentals.ca', url:'', note:'General boards that the McGill guide lists.' }
+];
+var STATUS = ['—','To do','Drafted','Posted','Rented'];
+
+var CONTACT_FIELDS = [
+  { k:'name', label:'Name shown on listing', req:true },
+  { k:'role', label:'You are the…', type:'select', opts:['','Owner','Broker','Property manager','Owner rep (family)'], req:true },
+  { k:'phone', label:'Phone', type:'tel', req:true },
+  { k:'email', label:'Email', type:'email', req:true },
+  { k:'pref', label:'Best way to reach you', type:'select', opts:['','Text','Call','Email','Any'] },
+  { k:'lang', label:'Languages', hint:'e.g. English, French, Mandarin' },
+  { k:'viewings', label:'Viewing times', hint:'e.g. Weeknights 6–8 pm, Sat 10–2', wide:true }
+];
+
+var UNIT_SECTIONS = [
+  { title:'Basics', fields:[
+    { k:'address', label:'Street address', req:true },
+    { k:'unit', label:'Apt #' },
+    { k:'postal', label:'Postal code', hint:'Look up on Canada Post' },
+    { k:'area', label:'Neighbourhood', req:true },
+    { k:'qcSize', label:'Quebec size', hint:'e.g. 4½, 5½ (students search by this)', req:true },
+    { k:'beds', label:'Bedrooms', type:'number', req:true },
+    { k:'bedNote', label:'Bedroom note', hint:'e.g. 1 bedroom in basement' },
+    { k:'baths', label:'Bathrooms', type:'number', req:true },
+    { k:'sqft', label:'Area (sq ft)', type:'number' },
+    { k:'floor', label:'Floor', hint:'e.g. Ground + basement' },
+    { k:'year', label:'Year built', type:'number' }
+  ]},
+  { title:'Money & dates', fields:[
+    { k:'rent', label:'Rent ($/month)', type:'number', req:true },
+    { k:'avail', label:'Available from', type:'date', req:true },
+    { k:'term', label:'Lease type', type:'select', opts:['','12-month lease','Lease to June 30','Lease transfer','Sublet','Flexible'], req:true },
+    { k:'furn', label:'Furnished', type:'select', opts:['','Unfurnished','Semi-furnished','Furnished'], req:true },
+    { k:'incl', label:'Included in rent', type:'checks', opts:['Heat','Hot water','Electricity','Internet','Snow removal'], req:true, wide:true }
+  ]},
+  { title:'Inside', fields:[
+    { k:'appl', label:'Appliances', type:'checks', opts:['Fridge','Stove','Dishwasher','Microwave','Washer','Dryer','W/D hookups','Air conditioning','Heat pump'], wide:true },
+    { k:'feat', label:'Features', type:'checks', opts:['Balcony','Yard / terrace','Storage','Elevator','Bike storage','Hardwood floors','Brand-new building'], wide:true }
+  ]},
+  { title:'Rules', fields:[
+    { k:'pets', label:'Pets', type:'select', opts:['','No pets','Cats OK','Pets with conditions','Pets OK'] },
+    { k:'smoke', label:'Smoking', type:'select', opts:['','No smoking','Outside only','Allowed'] },
+    { k:'parking', label:'Parking', type:'select', opts:['','None (street, permit zone)','Outdoor spot','Indoor spot','Garage'] },
+    { k:'parkFee', label:'Parking fee ($/mo)', type:'number', hint:'0 if included' }
+  ]},
+  { title:'Location (students care most)', fields:[
+    { k:'metro', label:'Nearest metro', req:true },
+    { k:'metroMin', label:'Walk to metro (min)', type:'number' },
+    { k:'commute', label:'Transit to McGill (min)', type:'number', req:true, hint:'Google Maps, transit, to 845 Sherbrooke W' },
+    { k:'nearby', label:'Nearby', hint:'grocery, Jarry Park, Jean-Talon Market…', wide:true }
+  ]},
+  { title:'Description & source', fields:[
+    { k:'desc', label:'Your own description (2–4 lines)', type:'textarea', req:true, wide:true, hint:'What makes it nice to live in. The listing card (06) adds the facts.' },
+    { k:'src', label:'Source listing', type:'url', wide:true }
+  ]}
+];
+
+var PHOTO_ITEMS = [
+  'Living room (2 angles)', 'Kitchen + appliances', 'Each bedroom', 'Each bathroom',
+  'Basement bedroom with window (if any)', 'Building front', 'Balcony / yard', 'Floor plan (sketch is OK)',
+  'Short video walk-through (optional)'
+];
+
+var RULE_ITEMS = [
+  'No deposit asked. A deposit is illegal in Quebec. First month rent at lease signing is normal.',
+  'The application does not ask for SIN, credit card, passport number, or citizenship.',
+  'No wording that excludes people by origin, sex, religion, age, student or international status, etc.',
+  'Use the mandatory TAL lease form (Tribunal administratif du logement).',
+  'Building built in the last 5 years: fill in Section F of the lease (rent-increase exemption). Confirm the details with the TAL.',
+  'If a broker has a brokerage contract on the unit: get the broker\'s OK before you post it yourself.',
+  'Full street address in the listing. Students treat listings without an address as possible scams.',
+  'Real photos of this unit only, not stock or model photos.',
+  'A co-signer (guarantor) request is OK. Say so in the listing if you need one.'
+];
+
+var QUESTIONS = [
+  { k:'q_who', label:'User: Are you the owner, or the broker? Do Kai Yuan / Charisma hold an exclusive contract?', wide:true },
+  { k:'q_same', label:'User: Is Unit B (1832) the same type as Unit A (new 2025 build)? Same owner?', wide:true },
+  { k:'q_split', label:'User: Rent the whole unit only, or room by room to students?', type:'select', opts:['','Whole unit only','Room by room OK','Either'] },
+  { k:'q_date', label:'User: Target move-in (now / Jan 1 winter term / July 1)?' },
+  { k:'q_budget', label:'User: Max you want to spend on paid listings ($)?', type:'number' },
+  { k:'q_notes', label:'User: Other notes', type:'textarea', wide:true }
+];
+
+var INV_STATUS = ['', 'Vacant', 'Leaving (notice given)', 'Lease ends ≤ 6 months', 'Occupied'];
+var INV_BROKER = ['', 'No', 'Yes – Kai Yuan', 'Not sure'];
+var INV_BUILDING = ['', '1835 Bélanger', '1832 Bélanger', 'Other'];
+var PREP_ITEMS = [
+  'Find the Kai Yuan contract. Write down: end date, "exclusive" yes/no, the commission clause, which units it covers.',
+  'Ask Kai Yuan: "Can I also post on student sites?" and "Can I use the photos, with the photographer\'s written OK?"',
+  'Fill in the unit table above (12 rows).',
+  'Make a Places4Students landlord account (McGill). Do not publish yet.',
+  'Make a CSU HOJO Classifieds account (Concordia).',
+  'Join the Facebook group "McGill Off-Campus Housing".',
+  'Make a liv.rent landlord account.',
+  'Take your own photos of each vacant unit (shot list in Card 04).',
+  'Fill in Card 02 (contact) and Card 03 (unit facts) for each vacant unit.'
+];
+function blankInv() { var a = []; for (var i = 0; i < 12; i++) a.push({}); return a; }
+
+var DEFAULT_STATE = {
+  inventory: (function () { var a = blankInv();
+    a[0] = { unit:'Apt 1', bldg:'1835 Bélanger', size:'2 bd / 2 ba', status:'Vacant', broker:'Yes – Kai Yuan', rent:'1790' };
+    a[1] = { unit:'', bldg:'1832 Bélanger', status:'Vacant', broker:'Yes – Kai Yuan' };
+    return a; })(),
+  prep: {},
+  contact: {},
+  units: [
+    { tag:'A', address:'1835 Rue Bélanger', unit:'1', area:'Villeray (Villeray–Saint-Michel–Parc-Extension)',
+      qcSize:'', beds:'2', bedNote:'1 bedroom in the basement', baths:'2', year:'2025', rent:'1790',
+      metro:'Fabre (blue line), D\'Iberville close by', feat:['Brand-new building'],
+      nearby:'Grocery stores, cafés, restaurants, schools, parks. Walk Score 94.',
+      src:'https://www.centris.ca/en/condos-apartments~for-rent~montreal-villeray-saint-michel-parc-extension/13852670' },
+    { tag:'B', address:'1832 Rue Bélanger', area:'La Petite-Patrie (Rosemont–La Petite-Patrie)',
+      src:'https://www.realtor.ca/real-estate/30214814/1832-rue-belanger-montreal-rosemontla-petite-patrie-la-petite-patrie' }
+  ],
+  platforms: {}, photos: [{}, {}], rules: {}, questions: {}, prose: {},
+  ui: { unit:0, photo:0, out:0 }
+};
+
+/* =========================================================
+   CALCULATIONS (pure)
+   ========================================================= */
+function requiredUnitKeys() {
+  var out = [];
+  UNIT_SECTIONS.forEach(function (s) { s.fields.forEach(function (f) { if (f.req) out.push(f); }); });
+  return out;
+}
+function isFilled(v) { return Array.isArray(v) ? v.length > 0 : v !== undefined && v !== null && String(v).trim() !== ''; }
+
+function readiness(unit, contact, photos) {
+  var missing = [];
+  requiredUnitKeys().forEach(function (f) {
+    // "Included" may be empty on purpose (nothing included) once the user ticks "none"
+    if (f.k === 'incl' && unit.inclNone) return;
+    if (!isFilled(unit[f.k])) missing.push(f.label);
+  });
+  CONTACT_FIELDS.forEach(function (f) { if (f.req && !isFilled(contact[f.k])) missing.push('Contact: ' + f.label); });
+  var photoCount = Object.keys(photos || {}).filter(function (k) { return photos[k]; }).length;
+  if (photoCount < 5) missing.push('Photos: ' + photoCount + '/5 minimum');
+  var total = requiredUnitKeys().length + CONTACT_FIELDS.filter(function (f) { return f.req; }).length + 1;
+  var done = total - missing.length;
+  return { done: done, total: total, pct: Math.round(done / total * 100), missing: missing };
+}
+
+// Unit table: status + broker -> what to do
+function unitAction(r) {
+  if (!r || !r.status) return { cls:'none', text:'' };
+  if (r.status === 'Occupied') return { cls:'none', text:'Nothing yet' };
+  var onContract = r.broker === 'Yes – Kai Yuan' || r.broker === 'Not sure' || !r.broker;
+  if (r.status === 'Vacant') return onContract ? { cls:'wait', text:'Check contract (Q3)' } : { cls:'go', text:'List now' };
+  // leaving / lease ends soon
+  return onContract ? { cls:'wait', text:'Prep · check contract' } : { cls:'prep', text:'Prep listing' };
+}
+function invSummary(rows) {
+  var c = { filled:0, vacant:0, leaving:0, go:0, wait:0 };
+  rows.forEach(function (r) {
+    if (!r.status) return;
+    c.filled++;
+    if (r.status === 'Vacant') c.vacant++;
+    if (r.status === 'Leaving (notice given)' || r.status === 'Lease ends ≤ 6 months') c.leaving++;
+    var a = unitAction(r);
+    if (a.cls === 'go') c.go++;
+    if (a.cls === 'wait') c.wait++;
+  });
+  return c;
+}
+
+function money(n) { var x = Number(n); return isFinite(x) && x > 0 ? '$' + x.toLocaleString('en-CA') : ''; }
+function shortArea(a) { return (a || '').split('(')[0].trim(); }
+function fmtDate(d) {
+  if (!d) return '';
+  var t = new Date(d + 'T12:00:00');
+  return isNaN(t) ? d : t.toLocaleDateString('en-CA', { month:'long', day:'numeric', year:'numeric' });
+}
+
+function listingTitle(u) {
+  var parts = [];
+  var size = [u.beds ? u.beds + '-bedroom' : '', u.qcSize ? '(' + u.qcSize + ')' : ''].filter(Boolean).join(' ');
+  if (size) parts.push(size);
+  if (u.rent) parts.push(money(u.rent) + '/mo');
+  if (u.area) parts.push(shortArea(u.area));
+  if (u.metro) parts.push('near ' + u.metro.split('(')[0].trim() + ' metro');
+  if ((u.feat || []).indexOf('Brand-new building') > -1) parts.push('new building');
+  return parts.join(' · ') || '(fill in Card 03)';
+}
+
+function listingBody(u, c) {
+  var L = [];
+  var addr = [u.address, u.unit ? 'apt ' + u.unit : '', 'Montréal', u.postal].filter(Boolean).join(', ');
+  if (u.desc) { L.push(u.desc.trim()); L.push(''); }
+  L.push('THE BASICS');
+  if (addr) L.push('- Address: ' + addr);
+  if (u.area) L.push('- Neighbourhood: ' + u.area);
+  var rooms = [u.qcSize, u.beds ? u.beds + ' bedrooms' + (u.bedNote ? ' (' + u.bedNote + ')' : '') : '', u.baths ? u.baths + ' bathrooms' : ''].filter(Boolean).join(', ');
+  if (rooms) L.push('- Size: ' + rooms + (u.sqft ? ', ' + u.sqft + ' sq ft' : ''));
+  if (u.floor) L.push('- Floor: ' + u.floor);
+  if (u.year) L.push('- Built: ' + u.year);
+  L.push('');
+  L.push('RENT & LEASE');
+  if (u.rent) L.push('- Rent: ' + money(u.rent) + ' per month');
+  var incl = u.incl || [];
+  L.push('- Included: ' + (incl.length ? incl.join(', ') : 'nothing; tenant pays electricity/heat (Hydro-Québec) and internet'));
+  if (u.avail) L.push('- Available: ' + fmtDate(u.avail));
+  if (u.term) L.push('- Lease: ' + u.term + ' (standard TAL lease, no deposit)');
+  if (u.furn) L.push('- ' + u.furn);
+  L.push('');
+  var appl = u.appl || [], feat = u.feat || [];
+  if (appl.length || feat.length) {
+    L.push('INSIDE');
+    if (appl.length) L.push('- Appliances: ' + appl.join(', '));
+    if (feat.length) L.push('- Features: ' + feat.join(', '));
+    L.push('');
+  }
+  if (u.metro || u.commute || u.nearby) {
+    L.push('LOCATION');
+    if (u.metro) L.push('- Metro: ' + u.metro + (u.metroMin ? ' (' + u.metroMin + ' min walk)' : ''));
+    if (u.commute) L.push('- About ' + u.commute + ' min by transit to McGill downtown campus');
+    if (u.nearby) L.push('- Nearby: ' + u.nearby);
+    L.push('');
+  }
+  var rules = [u.pets, u.smoke, u.parking ? 'Parking: ' + u.parking + (u.parkFee && Number(u.parkFee) > 0 ? ' (' + money(u.parkFee) + '/mo)' : '') : ''].filter(Boolean);
+  if (rules.length) { L.push('RULES'); rules.forEach(function (r) { L.push('- ' + r); }); L.push(''); }
+  L.push('CONTACT');
+  var who = [c.name, c.role ? '(' + c.role.toLowerCase() + ')' : ''].filter(Boolean).join(' ');
+  if (who) L.push('- ' + who);
+  if (c.phone) L.push('- Phone: ' + c.phone + (c.pref ? ' (' + c.pref.toLowerCase() + ' preferred)' : ''));
+  if (c.email) L.push('- Email: ' + c.email);
+  if (c.lang) L.push('- Languages: ' + c.lang);
+  if (c.viewings) L.push('- Viewings: ' + c.viewings);
+  L.push('Students welcome. Co-signer accepted.');
+  return L.join('\n');
+}
+
+/* =========================================================
+   ACTIONS (UI)
+   ========================================================= */
+var $ = function (id) { return document.getElementById(id); };
+var state = loadState();
+
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+function loadState() {
+  var s = null;
+  try { s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
+  if (!s) { try { s = JSON.parse($('savedState').textContent); } catch (e) {} }
+  var base = clone(DEFAULT_STATE);
+  if (!s) return base;
+  Object.keys(base).forEach(function (k) { if (s[k] === undefined) s[k] = base[k]; });
+  return s;
+}
+var saveTimer;
+function save() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(function () {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+  }, 250);
+}
+
+function toast(msg) {
+  var t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(function () { t.classList.remove('show'); }, 2200);
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]; }); }
+
+// One field -> HTML. obj = the object that holds the value, path = data-path
+function fieldHTML(f, obj, path) {
+  var v = obj[f.k];
+  var id = path.replace(/\./g, '_');
+  var req = f.req ? ' <span class="req">*</span>' : '';
+  var cls = 'f' + (f.wide ? ' wide' : '');
+  var emptyCls = f.req && !isFilled(v) ? ' class="empty-req"' : '';
+  var h = '<div class="' + cls + '"><label for="' + id + '">' + esc(f.label) + req + '</label>';
+  var t = f.type || 'text';
+  if (t === 'select') {
+    h += '<select id="' + id + '" data-path="' + path + '"' + emptyCls + '>' +
+      f.opts.map(function (o) { return '<option' + (o === (v || '') ? ' selected' : '') + ' value="' + esc(o) + '">' + (o ? esc(o) : 'Select…') + '</option>'; }).join('') + '</select>';
+  } else if (t === 'textarea') {
+    h += '<textarea id="' + id + '" data-path="' + path + '"' + emptyCls + '>' + esc(v || '') + '</textarea>';
+  } else if (t === 'checks') {
+    var arr = v || [];
+    h += '<div class="checks">' + f.opts.map(function (o) {
+      return '<label class="chk"><input type="checkbox" data-path="' + path + '" data-opt="' + esc(o) + '"' + (arr.indexOf(o) > -1 ? ' checked' : '') + '>' + esc(o) + '</label>';
+    }).join('');
+    if (f.k === 'incl') h += '<label class="chk"><input type="checkbox" data-path="' + path.replace(/incl$/, 'inclNone') + '" data-bool="1"' + (obj.inclNone ? ' checked' : '') + '>Nothing included</label>';
+    h += '</div>';
+  } else {
+    h += '<input type="' + t + '" id="' + id + '" data-path="' + path + '" value="' + esc(v || '') + '"' + emptyCls + '>';
+  }
+  if (f.hint) h += '<span class="hint">' + esc(f.hint) + '</span>';
+  return h + '</div>';
+}
+
+function getObj(path) { // returns [parentObject, key]
+  var parts = path.split('.'), o = state;
+  for (var i = 0; i < parts.length - 1; i++) {
+    if (o[parts[i]] === undefined) o[parts[i]] = {};
+    o = o[parts[i]];
+  }
+  return [o, parts[parts.length - 1]];
+}
+
+function tabsHTML(uiKey) {
+  return state.units.map(function (u, i) {
+    return '<button type="button" data-tab="' + uiKey + '" data-i="' + i + '" class="' + (state.ui[uiKey] === i ? 'on' : '') + '">Unit ' + u.tag + ' · ' + esc(u.address || '') + '</button>';
+  }).join('');
+}
+
+function selHTML(path, opts, v) {
+  return '<select data-path="' + path + '">' + opts.map(function (o) {
+    return '<option value="' + esc(o) + '"' + (o === (v || '') ? ' selected' : '') + '>' + (o ? esc(o) : '—') + '</option>';
+  }).join('') + '</select>';
+}
+function renderInventory() {
+  if (!Array.isArray(state.inventory)) state.inventory = clone(DEFAULT_STATE.inventory);
+  while (state.inventory.length < 12) state.inventory.push({});
+  $('invRows').innerHTML = state.inventory.map(function (r, i) {
+    var p = 'inventory.' + i + '.';
+    return '<tr>' +
+      '<td><input type="text" data-path="' + p + 'unit" value="' + esc(r.unit || '') + '" placeholder="#' + (i + 1) + '"></td>' +
+      '<td>' + selHTML(p + 'bldg', INV_BUILDING, r.bldg) + '</td>' +
+      '<td><input type="text" data-path="' + p + 'size" value="' + esc(r.size || '') + '" placeholder="4½"></td>' +
+      '<td>' + selHTML(p + 'status', INV_STATUS, r.status) + '</td>' +
+      '<td><input type="date" data-path="' + p + 'end" value="' + esc(r.end || '') + '"></td>' +
+      '<td>' + selHTML(p + 'broker', INV_BROKER, r.broker) + '</td>' +
+      '<td><input type="number" data-path="' + p + 'rent" value="' + esc(r.rent || '') + '" style="width:90px"></td>' +
+      '<td class="act" id="act' + i + '"></td></tr>';
+  }).join('');
+}
+function updateInventory() {
+  state.inventory.forEach(function (r, i) {
+    var a = unitAction(r), el = $('act' + i);
+    if (el) {
+      el.textContent = a.text; el.className = 'act ' + a.cls;
+      el.parentNode.classList.toggle('blank', !r.status && !r.unit && !r.bldg);
+    }
+  });
+  var c = invSummary(state.inventory);
+  $('invSummary').textContent = c.filled + '/12 rows filled · ' + c.vacant + ' vacant · ' + c.leaving + ' leaving soon · ' +
+    c.go + ' can be listed now · ' + c.wait + ' wait for the contract check';
+}
+function renderPrep() {
+  $('prepList').innerHTML = PREP_ITEMS.map(function (t, j) {
+    return '<li><input type="checkbox" data-path="prep.' + j + '" data-bool="1"' + (state.prep[j] ? ' checked' : '') + '><span>' + esc(t) + '</span></li>';
+  }).join('');
+}
+
+function renderPlatforms() {
+  $('platformRows').innerHTML = PLATFORMS.map(function (p) {
+    var name = p.url ? '<a href="' + p.url + '" target="_blank" rel="noopener">' + esc(p.name) + '</a>' : esc(p.name);
+    var cells = [0, 1].map(function (i) {
+      var path = 'platforms.' + p.id + '_' + i;
+      var v = state.platforms[p.id + '_' + i] || '—';
+      return '<td><select data-path="' + path + '">' + STATUS.map(function (s) { return '<option' + (s === v ? ' selected' : '') + '>' + s + '</option>'; }).join('') + '</select></td>';
+    }).join('');
+    return '<tr><td>' + name + '<div class="muted small" style="display:none" data-sm>' + esc(p.note) + '</div></td><td class="hide-sm muted small">' + esc(p.note) + '</td>' + cells + '</tr>';
+  }).join('');
+}
+
+function renderContact() {
+  $('contactForm').innerHTML = CONTACT_FIELDS.map(function (f) { return fieldHTML(f, state.contact, 'contact.' + f.k); }).join('');
+}
+
+function renderUnit() {
+  var i = state.ui.unit, u = state.units[i];
+  $('unitTabs').innerHTML = tabsHTML('unit');
+  $('unitForm').innerHTML = UNIT_SECTIONS.map(function (s) {
+    return '<h3>' + esc(s.title) + '</h3><div class="grid">' +
+      s.fields.map(function (f) { return fieldHTML(f, u, 'units.' + i + '.' + f.k); }).join('') + '</div>';
+  }).join('');
+}
+
+function renderPhotos() {
+  var i = state.ui.photo;
+  if (!state.photos[i]) state.photos[i] = {};
+  $('photoTabs').innerHTML = tabsHTML('photo');
+  $('photoList').innerHTML = PHOTO_ITEMS.map(function (p, j) {
+    return '<li><input type="checkbox" data-path="photos.' + i + '.' + j + '" data-bool="1"' + (state.photos[i][j] ? ' checked' : '') + '><span>' + esc(p) + '</span></li>';
+  }).join('');
+}
+
+function renderRules() {
+  $('rulesList').innerHTML = RULE_ITEMS.map(function (r, j) {
+    return '<li><input type="checkbox" data-path="rules.' + j + '" data-bool="1"' + (state.rules[j] ? ' checked' : '') + '><span>' + esc(r) + '</span></li>';
+  }).join('');
+}
+
+function renderQuestions() {
+  $('questionForm').innerHTML = QUESTIONS.map(function (f) { return fieldHTML(f, state.questions, 'questions.' + f.k); }).join('');
+}
+
+function renderProse() {
+  Array.prototype.forEach.call(document.querySelectorAll('[data-prose]'), function (el) {
+    var k = el.getAttribute('data-prose');
+    if (state.prose[k]) el.innerHTML = state.prose[k];
+  });
+}
+
+// Live outputs: no re-render of inputs (keeps focus while typing)
+function updateOutputs() {
+  var i = state.ui.out, u = state.units[i];
+  $('outTabs').innerHTML = tabsHTML('out');
+  var r = readiness(u, state.contact, state.photos[i]);
+  $('outScore').textContent = r.pct + '%';
+  $('outMeter').style.width = r.pct + '%';
+  $('outMissing').textContent = r.missing.length ? 'Missing: ' + r.missing.join(' · ') : 'All minimum fields are done.';
+  $('outTitle').textContent = listingTitle(u);
+  $('outBody').textContent = listingBody(u, state.contact);
+
+  var cu = readiness(state.units[state.ui.unit], state.contact, state.photos[state.ui.unit]);
+  $('unitPill').textContent = 'Unit ' + state.units[state.ui.unit].tag + ': ' + cu.pct + '% ready';
+  $('unitPill').className = 'pill ' + (cu.pct >= 90 ? 'ok' : cu.pct >= 50 ? 'mid' : 'low');
+
+  updateInventory();
+  // Print-only: both units as finished listing text
+  $('printUnits').innerHTML = state.units.map(function (un) {
+    return '<h3>Unit ' + un.tag + ' · ' + esc(un.address || '') + '</h3><pre class="out"><b>' + esc(listingTitle(un)) + '</b>\n\n' + esc(listingBody(un, state.contact)) + '</pre>';
+  }).join('');
+
+  var rulesDone = RULE_ITEMS.filter(function (_, j) { return state.rules[j]; }).length;
+  $('statusTiles').innerHTML = state.units.map(function (un, k) {
+    var rr = readiness(un, state.contact, state.photos[k]);
+    var posted = PLATFORMS.filter(function (p) { var s = state.platforms[p.id + '_' + k]; return s === 'Posted' || s === 'Rented'; }).length;
+    return '<div class="f" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px">' +
+      '<span class="muted small">Unit ' + un.tag + ' · ' + esc(un.address || '') + '</span>' +
+      '<span class="big">' + rr.pct + '%</span><div class="meter"><div style="width:' + rr.pct + '%"></div></div>' +
+      '<span class="muted small">Posted on ' + posted + '/' + PLATFORMS.length + ' platforms</span></div>';
+  }).join('') +
+  '<div class="f" style="background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px">' +
+    '<span class="muted small">Quebec rules check</span><span class="big">' + rulesDone + '/' + RULE_ITEMS.length + '</span>' +
+    '<div class="meter"><div style="width:' + Math.round(rulesDone / RULE_ITEMS.length * 100) + '%"></div></div><span class="muted small">Card 05</span></div>';
+}
+
+function renderAll() {
+  renderProse(); renderInventory(); renderPrep(); renderPlatforms(); renderContact(); renderUnit(); renderPhotos(); renderRules(); renderQuestions(); updateOutputs();
+}
+
+// Input handling (one listener for all fields)
+function onInput(e) {
+  var el = e.target, path = el.getAttribute && el.getAttribute('data-path');
+  if (!path) return;
+  var ref = getObj(path), o = ref[0], k = ref[1];
+  if (el.getAttribute('data-opt') !== null) {
+    var arr = Array.isArray(o[k]) ? o[k] : [];
+    var opt = el.getAttribute('data-opt');
+    arr = arr.filter(function (x) { return x !== opt; });
+    if (el.checked) arr.push(opt);
+    o[k] = arr;
+  } else if (el.getAttribute('data-bool')) {
+    o[k] = el.checked;
+  } else {
+    o[k] = el.value;
+    if (el.classList.contains('empty-req') || el.closest('.f') && el.closest('.f').querySelector('.req')) {
+      el.classList.toggle('empty-req', !isFilled(el.value));
+    }
+  }
+  save();
+  updateOutputs();
+}
+document.addEventListener('input', onInput);
+document.addEventListener('change', function (e) { if (e.target.type === 'checkbox' || e.target.tagName === 'SELECT') onInput(e); });
+
+document.addEventListener('click', function (e) {
+  var b = e.target.closest('[data-tab]');
+  if (!b) return;
+  var key = b.getAttribute('data-tab'), i = Number(b.getAttribute('data-i'));
+  state.ui[key] = i; save();
+  if (key === 'unit') renderUnit();
+  if (key === 'photo') renderPhotos();
+  updateOutputs();
+});
+
+function copy(text, label) {
+  var done = function () { toast(label + ' copied'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else fallback();
+  function fallback() {
+    var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (er) { toast('Copy failed. Select the text by hand.'); }
+    ta.remove();
+  }
+}
+$('copyTitle').addEventListener('click', function () { copy($('outTitle').textContent, 'Title'); });
+$('copyBody').addEventListener('click', function () { copy($('outBody').textContent, 'Description'); });
+
+// Edit static text
+var editing = false;
+$('editBtn').addEventListener('click', function () {
+  editing = !editing;
+  document.body.classList.toggle('editing', editing);
+  Array.prototype.forEach.call(document.querySelectorAll('[data-prose]'), function (el) {
+    el.setAttribute('contenteditable', editing ? 'true' : 'false');
+    if (!editing) state.prose[el.getAttribute('data-prose')] = el.innerHTML;
+  });
+  $('editBtn').textContent = editing ? 'Save text' : 'Edit text';
+  $('editBtn').classList.toggle('primary', editing);
+  if (!editing) { save(); toast('Text saved'); }
+});
+
+// Download: bake current state into the file
+$('downloadBtn').addEventListener('click', function () {
+  if (editing) $('editBtn').click();
+  var html = '<!doctype html>\n' + document.documentElement.outerHTML;
+  var json = JSON.stringify(state).replace(/</g, '\\u003c');
+  html = html.replace(/(<script type="application\/json" id="savedState">)[\s\S]*?(<\/script>)/, function (_, a, b) { return a + json + b; });
+  // Strip rendered values so the file rebuilds from savedState
+  var blob = new Blob([html], { type:'text/html' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'belanger_student_listings_v2.html';
+  document.body.appendChild(a); a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  toast('Downloaded with your answers inside');
+});
+
+$('printBtn').addEventListener('click', function () { if (editing) $('editBtn').click(); window.print(); });
+
+$('resetBtn').addEventListener('click', function () {
+  if (!confirm('Clear all answers and go back to the pre-filled version?')) return;
+  try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+  state = clone(DEFAULT_STATE);
+  renderAll(); toast('Reset done');
+});
+
+renderAll();
+
+// Expose pure functions for testing
+window.__calc = { readiness: readiness, listingTitle: listingTitle, listingBody: listingBody, DEFAULT_STATE: DEFAULT_STATE };
+})();
+</script>
+
+</body></html>

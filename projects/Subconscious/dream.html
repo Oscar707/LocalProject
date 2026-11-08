@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Dream Journal</title>
+<style>
+  :root {
+    --bg: #0e1014;
+    --surface: #161920;
+    --surface-2: #1d212b;
+    --border: #272c38;
+    --text: #e4e7ec;
+    --muted: #98a1b2;
+    --accent: #7aa2f7;
+    --accent-2: #9ece6a;
+    --warn: #e0af68;
+    --violet: #bb9af7;
+    --danger: #f7768e;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 110px; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(14,16,20,.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .bar { max-width: 760px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 8px; }
+  .bar h1 { font-size: 18px; margin: 0; flex: 1; }
+  button {
+    font: inherit; font-size: 14px; font-weight: 600;
+    color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; cursor: pointer; min-height: 38px;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #0e1014; border-color: var(--accent); }
+  button.hidden { display: none; }
+  nav {
+    max-width: 760px; margin: 0 auto;
+    display: flex; gap: 6px; overflow-x: auto;
+    padding: 0 16px 10px; scrollbar-width: none;
+  }
+  nav::-webkit-scrollbar { display: none; }
+  nav a {
+    flex: none; font-size: 13px; color: var(--muted); text-decoration: none;
+    padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px;
+  }
+  nav a:hover { color: var(--text); border-color: var(--accent); }
+  nav a.new { border-color: var(--accent-2); color: var(--accent-2); }
+  .banner { display: none; max-width: 760px; margin: 0 auto; padding: 0 16px 10px; font-size: 13px; color: var(--warn); }
+  body.editing .banner { display: block; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 16px 64px; }
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  body.editing section { border-style: dashed; border-color: var(--accent); }
+  body.editing main *:focus { outline: none; background: rgba(122,162,247,.08); border-radius: 4px; }
+  h2 { margin: 0 0 4px; font-size: 20px; display: flex; gap: 8px; align-items: baseline; }
+  h2 .n { color: var(--accent); font-size: 14px; font-weight: 700; }
+  .date { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  h3 {
+    margin: 20px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--accent-2);
+  }
+  h3.jung { color: var(--violet); }
+  p { margin: 0 0 10px; }
+  ul { margin: 0 0 10px; padding-left: 22px; }
+  li { margin: 4px 0; }
+  li::marker { color: var(--violet); }
+  .dream {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 0 10px 10px 0;
+    padding: 12px 14px; font-style: italic;
+  }
+  .symbols { display: grid; gap: 8px; margin: 0 0 12px; }
+  .sym {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-size: 15px;
+  }
+  .sym b { display: block; color: var(--violet); font-size: 14px; margin-bottom: 2px; }
+  /* Dream sequence strip */
+  .seq { display: grid; gap: 0; margin: 0 0 12px; padding: 0; list-style: none; }
+  .seq li {
+    position: relative; margin: 0; padding: 6px 0 12px 30px; font-size: 14.5px;
+    border-left: 2px solid var(--border); margin-left: 8px;
+  }
+  .seq li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  .seq li::before {
+    content: ''; position: absolute; left: -7px; top: 10px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--surface); border: 2px solid var(--accent);
+  }
+  .seq li.calm::before { border-color: var(--accent-2); }
+  .seq li.turn::before { border-color: var(--warn); background: var(--warn); }
+  .seq li.dark::before { border-color: var(--danger); background: var(--danger); }
+  .seq li span { display: block; font-size: 12px; color: var(--muted); }
+  blockquote {
+    margin: 12px 0; padding: 10px 14px;
+    border-left: 3px solid var(--violet); background: var(--surface-2);
+    border-radius: 0 8px 8px 0; color: var(--muted); font-style: italic;
+  }
+  .user {
+    background: var(--surface-2); border: 1px dashed var(--warn); border-radius: 10px;
+    padding: 10px 12px; font-size: 15px; margin-bottom: 10px;
+  }
+  .user .q { color: var(--warn); font-weight: 600; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  .tag {
+    font-size: 12.5px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--violet); color: var(--violet);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 0 0 10px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+  td b { color: var(--violet); }
+  .muted { color: var(--muted); font-size: 13.5px; }
+  code {
+    font: 13.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: 1px 6px; border-radius: 6px;
+  }
+  .toast {
+    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(80px);
+    background: var(--surface-2); border: 1px solid var(--accent); color: var(--text);
+    padding: 10px 16px; border-radius: 10px; font-size: 14px;
+    transition: transform .25s ease; z-index: 20; max-width: calc(100% - 32px);
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+  @media (max-width: 480px) {
+    body { font-size: 15.5px; }
+    section { padding: 14px; }
+    .bar h1 { font-size: 16px; }
+    button { padding: 7px 10px; font-size: 13px; }
+  }
+</style>
+<link type="text/css" rel="stylesheet" id="dark-mode-custom-link"><link type="text/css" rel="stylesheet" id="dark-mode-general-link"><style lang="en" type="text/css" id="dark-mode-custom-style"></style><style lang="en" type="text/css" id="dark-mode-native-style"></style><style lang="en" type="text/css" id="dark-mode-native-sheet"></style></head>
+<body id="artifacts-component-root-html">
+<header>
+  <div class="bar">
+    <h1>Dream Journal</h1>
+    <button id="editBtn" class="primary">Edit</button>
+    <button id="cancelBtn" class="hidden">Cancel</button>
+    <button id="downloadBtn">Download</button>
+  </div>
+  <div class="banner">Edit mode: tap any text to change it. Fill in the User: ' ' fields. Tap Save when done.</div>
+  <nav>
+    <a href="#how">How to use</a>
+    <a href="#patterns" class="new">Patterns</a>
+    <a href="#card-02" class="new">02 Teeth</a>
+    <a href="#card-01">01 Name</a>
+  </nav>
+</header>
+
+<main id="content" contenteditable="false">
+
+  <!-- ===== CARD 00: GOAL / HOW TO USE ===== -->
+  <section id="how">
+    <h2><span class="n">00</span> How to use</h2>
+    <p>Goal: record each dream, read it from the view of Carl Jung, and find the patterns across dreams over time.</p>
+    <ul>
+      <li>Dictate a dream in chat: <code>New dream @dream.html</code></li>
+      <li>The AI adds one card per dream. The newest dream is at the top.</li>
+      <li>The AI updates the <b>Patterns</b> card when symbols come back.</li>
+      <li>Fill in the <b>User: ' '</b> fields in Edit mode. Your associations make the next reading more accurate.</li>
+    </ul>
+    <h3>General context (optional)</h3>
+    <div class="user"><span class="q">What is happening in your life now? (stress, changes, relationships, health, sleep)</span><br>User: ' '</div>
+  </section>
+
+  <!-- ===== PATTERNS ACROSS DREAMS ===== -->
+  <section id="patterns">
+    <h2><span class="n">★</span> Patterns across dreams</h2>
+    <p class="date">Updated 2026-11-01 · 2 dreams</p>
+    <p>Jung said that one dream is like one sentence. A <b>dream series</b> is the full text. The themes that come back are more important than any single symbol.</p>
+    <table>
+      <tbody><tr><th>Theme</th><th>Dream 01</th><th>Dream 02</th></tr>
+      <tr><td><b>Blocked expression</b></td><td>Cannot write my name</td><td>Cannot speak</td></tr>
+      <tr><td><b>Old thing does not work</b></td><td>Every pencil fails</td><td>Bubble tea on the shelf is expired</td></tr>
+      <tr><td><b>Something new must come</b></td><td>New instrument for the name?</td><td>Order a new tea; new teeth grow</td></tr>
+      <tr><td><b>Place</b></td><td>School (old, collective)</td><td>Shop that comes back (inner, personal)</td></tr>
+    </tbody></table>
+    <blockquote>Strongest pattern so far: in both dreams, the ego wants to express itself (name, voice), and the old means fail. The psyche seems to insist on a renewal of how you show yourself to the world.</blockquote>
+    <div class="user"><span class="q">Do you see this theme in your waking life?</span><br>User: ' '</div>
+  </section>
+
+  <!-- ===== CARD 02 ===== -->
+  <section id="card-02">
+    <h2><span class="n">02</span> The Expired Tea and the New Teeth</h2>
+    <p class="date">2026-11-01</p>
+    <div class="tags">
+      <span class="tag">recurring place</span><span class="tag">teeth</span><span class="tag">mirror</span><span class="tag">loss of voice</span><span class="tag">number two</span>
+    </div>
+
+    <h3>The dream</h3>
+    <div class="dream">
+      <p>I go to get bubble tea at a shop. It is a fictional shop, and I visited it before in other dreams. The decoration is white, woody and pretty. I look for brown sugar bubble tea, but the one on the shelf is expired. Thus I order a new brown sugar bubble milk tea. Suddenly my teeth hurt. I say, "One second, I will go to the bathroom." Then I cannot say any words. I look in the mirror. Two teeth grow out from my upper palate. My bones split into two. My teeth are shaky.</p>
+    </div>
+
+    <h3>The sequence</h3>
+    <ol class="seq">
+      <li class="calm">The familiar shop<span>Comfort, a known inner place</span></li>
+      <li class="calm">Look for the usual sweet<span>Desire for the habitual comfort</span></li>
+      <li class="turn">It is expired<span>The old comfort is no longer good</span></li>
+      <li class="turn">Order a new one<span>Adaptation: a fresh version of the same thing</span></li>
+      <li class="dark">Teeth hurt, then no voice<span>Pain, then loss of expression</span></li>
+      <li class="dark">Mirror: two new teeth, bones split<span>Transformation in the body, seen directly</span></li>
+    </ol>
+    <p class="muted">The dream moves from comfort to transformation. The turn point is the expired tea.</p>
+
+    <h3 class="jung">Interpretation (Jungian)</h3>
+    <div class="symbols">
+      <div class="sym"><b>The shop that comes back</b>A place that returns in many dreams is a fixed location in your inner landscape. White and wood suggest something clean, natural and safe. Jung would see it as a sanctuary of the psyche: a place where the unconscious meets you. When a known place returns, pay attention: the unconscious uses it as a stage for a new message.</div>
+      <div class="sym"><b>Brown sugar bubble tea</b>A sweet, familiar pleasure. It is comfort, reward and care for yourself. In the language of the psyche, it is the "usual way to feel good."</div>
+      <div class="sym"><b>Expired on the shelf</b>The ready-made comfort has passed its date. This is the key image. Something that nourished you before is now stale: a habit, a way to cope, a role, or a relationship pattern. You do the right thing: you order a new one. But the new order is still the same drink. The dream asks: is a fresh copy of the old comfort enough?</div>
+      <div class="sym"><b>Teeth</b>Teeth bite, chew and break down food. Psychologically, they are the power to take in and process life (to "chew on" an experience) and to stand firm (to "have teeth"). Teeth also show in the smile, which is a part of the <i>persona</i>. Teeth dreams often come at times of transition, when a person feels less in control of how others see them.</div>
+      <div class="sym"><b>Loss of voice</b>You want to explain ("one second") but cannot speak. Here the ego loses the power of the word. This connects directly to Dream 01, where you could not write your name.</div>
+      <div class="sym"><b>The bathroom and the mirror</b>The bathroom is a private place, where we drop the public face. The mirror is the classic image of self-reflection. You go away from the others to see what happens to you. In Jung's terms, you leave the persona and meet an unknown image of yourself.</div>
+      <div class="sym"><b>Two teeth from the upper palate</b>New teeth grow in the wrong place, from inside, near the place of speech. It is like teething: growth that hurts. The number <b>two</b> is important for Jung. Two is the number of the opposites. It shows the moment when one unconscious thing starts to divide, so that consciousness can see it. Something new grows, but it does not fit the old structure yet.</div>
+      <div class="sym"><b>Bones split into two</b>Bones are the structure that holds you up. A split structure can mean a conflict between two sides of yourself. In old initiation myths (which Jung studied), the body is taken apart and made new. It is frightening, but the image is of renewal, not of death.</div>
+      <div class="sym"><b>Shaky teeth</b>The foundation feels unstable. The old way to "bite" into life is loose while the new way grows.</div>
+    </div>
+
+    <p>The whole dream is an image of <b>growing pains</b>. It begins in a safe place with a habit that you know. The habit is expired. When you try to replace it with a fresh copy, the body reacts: pain, silence, and a strange new growth.</p>
+    <p>Jung would ask what the dream <b>compensates</b>. Possibly your conscious attitude is "I will continue with what comforts me, and simply renew it." The unconscious answers with a stronger image: real change is happening inside you, and it changes how you speak and how you take in the world. For a moment, this change makes you mute. The old voice does not work, and the new voice did not form yet.</p>
+    <p>Put next to Dream 01, the message becomes clearer. In both dreams you try to express yourself (a name, a sentence), and you cannot. In Dream 01, the tools failed. In Dream 02, the body itself changes. The psyche seems to go deeper: from the instrument to the person.</p>
+
+    <blockquote>A Jungian question for the dream: not "Why do my teeth hurt?" but "What new thing grows in me that I cannot say out loud yet?"</blockquote>
+
+    <h3>The body level</h3>
+    <p class="muted">Jung also said to check the literal level first. Do you grind your teeth at night, have real tooth pain, or eat much sugar? If yes, part of the dream can come from the body. Both readings can be true at the same time.</p>
+
+    <p class="muted">Only the dreamer can confirm a dream meaning. If a reading does not "click," it is not the correct reading. Your associations are more important than any list of symbols.</p>
+
+    <h3>Your associations</h3>
+    <div class="user"><span class="q">What is this shop for you? When did you dream of it before, and what happened there?</span><br>User: ' '</div>
+    <div class="user"><span class="q">What comfort or habit in your life feels "expired" now?</span><br>User: ' '</div>
+    <div class="user"><span class="q">What do you want to say to someone, but cannot say yet?</span><br>User: ' '</div>
+    <div class="user"><span class="q">What feeling did you have at the mirror: fear, disgust, curiosity, or calm?</span><br>User: ' '</div>
+    <div class="user"><span class="q">Additional information (anything else you remember: people, colors, sounds, what happened the day before)</span><br>User: ' '</div>
+  </section>
+
+  <!-- ===== CARD 01 ===== -->
+  <section id="card-01">
+    <h2><span class="n">01</span> The Name I Could Not Write</h2>
+    <p class="date">2026-10-25</p>
+    <div class="tags">
+      <span class="tag">school</span><span class="tag">test</span><span class="tag">name</span><span class="tag">failed tool</span>
+    </div>
+
+    <h3>The dream</h3>
+    <div class="dream">
+      <p>I am in school. We have a test. The first task is to write my name. I know how to write my name. But each pencil I take does not work. I try pencil after pencil, and I cannot write my name.</p>
+    </div>
+
+    <h3 class="jung">Interpretation (Jungian)</h3>
+    <p>Jung said that a dream does not hide a message. It shows the present state of the psyche, as a picture. Thus we look at what the picture shows, not at what it hides.</p>
+
+    <div class="symbols">
+      <div class="sym"><b>The name</b>Your name is the label of the ego. It is the first word of the <i>persona</i>: the face you show to the world. At a test, the name tells the examiners "this is me."</div>
+      <div class="sym"><b>School and the test</b>School is the place of the collective: rules, grades, judgement from outside. A test asks, "Are you sufficient by their standard?"</div>
+      <div class="sym"><b>The pencils</b>A pencil is a tool of expression. The ego uses it to put itself into the world. In the dream, the knowledge is there. Only the instrument fails.</div>
+      <div class="sym"><b>Every pencil</b>The repetition is important. The unconscious does not let one other pencil solve the problem. This is not bad luck. It is a message that insists.</div>
+    </div>
+
+    <p>The central image is a gap: you know who you are, but the old tools cannot put it on paper. Jung would read this as a <b>compensation</b>. The conscious mind may think, "I know who I am. My identity is fixed." The unconscious answers, "The old way to state who you are does not work now."</p>
+    <p>This often occurs in a time of transition. The persona, the name that the collective gave you, becomes too small. Something larger, which Jung calls the <b>Self</b>, wants a new form of expression. The dream does not say that you lost your identity. It says that the old instruments of identity are now empty.</p>
+    <p>Also note the place. You are back in school, in an old stage of life, where others gave the grades. Possibly a part of you still waits for an outside authority to approve your name. The pencils that do not work can be a refusal: the psyche does not want to sign the old contract.</p>
+
+    <blockquote>A Jungian question for the dream: not "Why can I not write my name?" but "Which new name, or which new instrument, wants to write itself?"</blockquote>
+
+    <p class="muted">Jung taught that only the dreamer can confirm a dream meaning. If a reading does not "click," it is not the correct reading. Your associations are more important than any symbol list.</p>
+
+    <h3>Your associations</h3>
+    <div class="user"><span class="q">What changes in your life now (work, role, identity)?</span><br>User: ' '</div>
+    <div class="user"><span class="q">Where do you feel tested or judged now?</span><br>User: ' '</div>
+    <div class="user"><span class="q">What feeling did you have in the dream: panic, frustration, or calm?</span><br>User: ' '</div>
+    <div class="user"><span class="q">Additional information</span><br>User: ' '</div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  // ===== DATA =====
+  var KEY = 'dream_journal_v2'; // new key: v1 browser saves do not hide the new cards
+  var FILE = 'dream.html';
+
+  // ===== ACTIONS (UI) =====
+  var main = document.getElementById('content');
+  var editBtn = document.getElementById('editBtn');
+  var cancelBtn = document.getElementById('cancelBtn');
+  var downloadBtn = document.getElementById('downloadBtn');
+  var toast = document.getElementById('toast');
+  var before = '';
+  var editing = false;
+
+  function showToast(msg) {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast.t);
+    showToast.t = setTimeout(function () { toast.classList.remove('show'); }, 2400);
+  }
+
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved) main.innerHTML = saved;
+  } catch (e) {}
+
+  function setEditing(on) {
+    editing = on;
+    document.body.classList.toggle('editing', on);
+    main.setAttribute('contenteditable', on ? 'true' : 'false');
+    editBtn.textContent = on ? 'Save' : 'Edit';
+    cancelBtn.classList.toggle('hidden', !on);
+  }
+
+  editBtn.addEventListener('click', function () {
+    if (!editing) {
+      before = main.innerHTML;
+      setEditing(true);
+    } else {
+      setEditing(false);
+      try {
+        localStorage.setItem(KEY, main.innerHTML);
+        showToast('Saved in this browser. Tap Download to keep a file copy.');
+      } catch (e) {
+        showToast('Browser storage is not available. Tap Download to keep your edits.');
+      }
+    }
+  });
+
+  cancelBtn.addEventListener('click', function () {
+    main.innerHTML = before;
+    setEditing(false);
+    showToast('Changes discarded.');
+  });
+
+  downloadBtn.addEventListener('click', function () {
+    if (editing) editBtn.click();
+    var clone = document.documentElement.cloneNode(true);
+    clone.querySelector('#content').setAttribute('contenteditable', 'false');
+    clone.querySelector('body').classList.remove('editing');
+    clone.querySelector('#toast').classList.remove('show');
+    var blob = new Blob(['<!doctype html>\n' + clone.outerHTML], { type: 'text/html' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = FILE;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    showToast('Downloaded ' + FILE);
+  });
+})();
+</script>
+
+
+</body></html>
